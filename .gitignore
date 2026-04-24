@@ -1,0 +1,71 @@
+# ── Secrets ──────────────────────────────────────────────
+credentials.json
+noise/credentials.json
+*.pem
+*.key
+.env
+.env.*
+
+# ── Python ───────────────────────────────────────────────
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ipynb_checkpoints/
+
+# ── Node ─────────────────────────────────────────────────
+node_modules/
+dist/
+.vite/
+*.log
+npm-debug.log*
+
+# ── noise/ data (code yes, data no) ──────────────────────
+noise/data/
+noise/cache/
+noise/debug_heatmaps/
+noise/pickles/
+noise/landingpages/
+noise/aircraft_ranked.json
+noise/*.log
+noise/*.kml
+
+# noise/web is its own repo (github.com/bgatti/KnownRisks) — excluded here
+noise/web/
+
+# ── Project-wide large/ephemeral data ────────────────────
+audio/
+pickles/
+training/
+bokeh/
+KAPA_App_Dep/
+KAPA_Del_Gnd/
+KAPA_Tower/
+llm_transcribe/
+nlm/
+sql_queries/
+*.pkl
+*.db
+*.sqlite
+*.sqlite3
+*.mp3
+*.wav
+*.m4a
+*.flac
+*.tmp
+*.parquet
+*.feather
+
+# ── External data store (per user memory) ────────────────
+tracks_yearly.json
+
+# ── IDE / OS ─────────────────────────────────────────────
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.swp
