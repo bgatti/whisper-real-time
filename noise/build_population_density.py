@@ -40,13 +40,16 @@ COUNTIES = {
     "035": "Douglas",
 }
 
-# Bounding box for the raster grid (lat/lon)
-LAT_MIN, LAT_MAX = 39.50, 40.45
-LON_MIN, LON_MAX = -105.55, -104.60
+# Bounding box for the raster grid (lat/lon).
+# Expanded to cover the full Front Range corridor — KAPA south to KGXY north,
+# foothills west of KBDU east to plains past Denver airport.
+LAT_MIN, LAT_MAX = 39.45, 40.55
+LON_MIN, LON_MAX = -105.70, -104.50
 
-# Grid resolution (pixels)
-GRID_W = 400
-GRID_H = 400
+# Grid resolution (pixels). Larger bbox + same per-pixel resolution would
+# blow file size; keep cell size ≈ same by upping the grid count.
+GRID_W = 600
+GRID_H = 550
 
 OUT_PATH = Path(__file__).parent / "web" / "public" / "population_density.json"
 
@@ -54,7 +57,7 @@ OUT_PATH = Path(__file__).parent / "web" / "public" / "population_density.json"
 def fetch_json(url):
     """GET a URL and parse JSON."""
     req = Request(url, headers={"User-Agent": "noise-density-builder/1.0"})
-    with urlopen(req, timeout=30) as resp:
+    with urlopen(req, timeout=120) as resp:
         return json.loads(resp.read())
 
 

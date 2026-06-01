@@ -124,6 +124,21 @@ retry chain, but that's papering over a real defect — the 503 +
 header-driven retry the server spec'd is the lasting fix and lands
 cleanly once this branch merges.
 
+**Status — landed 2026-06-01.** Server-team patch shipped at PR
+[bgatti/KnownRisks#6](https://github.com/bgatti/KnownRisks/pull/6).
+Segments handler now detects pg-timeout / connection-drop errors and
+emits a clean `503` + `Retry-After: 10` + `{ transient: true,
+retryAfterS: 10, hint: 'tracks cache is warming up — retry in ~10s' }`.
+Pool query timeout left at 20 s (below Railway's ~30 s HTTP proxy)
+on purpose so we get a clean response shape rather than a 502 / TCP
+drop. Closes the response-code half of §1; latency itself remains
+§2's job.
+
+PR #6 also bundles a tiny data fix — adds the four user-confirmed
+SF/FF suffix tails (N256SF, N265SF, N58FF, N79FF) to McAir / Spartan
+in `flight_schools_fleets.json` + spells out the
+`^N\d+(SF|FF)$ at KBJC = McAir/Spartan` convention in the notes.
+
 ### 2. Cold-path response time on `excursions/segments`
 
 A first-time call for a 24 h / 5 nm window on the dev box was 16.2 s; in
