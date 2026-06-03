@@ -484,71 +484,182 @@ the full sub-event story while keeping the per-sortie row clean.
 
 ---
 
-## How to use
+## How to use — one-stop reference
 
-The library lives at `web/acsML/`. Three ways to consume it.
+What's live and where:
+
+```
+purposeML  ──► resolvePurposeWithShape  ──► /api/flights/current.purpose / .purpose_source
+                                            sortie_purpose / sortie_purpose_source
+                                            /api/purpose-ml/* (standalone)
+
+acsML      ──► sortiesPlugin            ──► /api/sorties[].sortie_acs
+                                            /api/acs-ml/* (standalone)
+
+phaseML    ──► both above               ──► (no public surface — composed)
+
+throttle   ──► sortie_path_throttle[]   ──► /api/sorties[].sortie_path_throttle
+              estimate evidence              acsML evidence.meanThrottle / preEventThrottle
+```
+
+The integration points are deliberately separate from the standalone
+endpoints. **For most consumers the answer is `GET /api/sorties` —
+everything's already on the row.**
+
+### Recipe 1 — show what a flight school C172 did today (the main pattern)
+
+```sh
+curl 'https://web-app-production-fedf.up.railway.app/api/sorties?airport=KBDU&hours=24'
+```
+
+Each `sorties[]` row carries:
+
+| Field | What you get |
+|---|---|
+| `sortie_purpose` / `sortie_purpose_source` | training / pattern_solo / tow_plane / glider_local / … plus `shape` vs `geometry` provenance |
+| `sortie_purpose_confidence` / `sortie_purpose_reasons` | when purposeML fired, the 0..1 score + the audit trail |
+| `sortie_path` + `sortie_path_throttle` | parallel arrays — path[i] is `[lat, lon, alt_msl, ts_ms, quality]` and throttle[i] is the 0..1 estimate (null if engineless or no prior real fix) |
+| `sortie_acs.phase_summary` | `{ n_takeoffs, n_landings, n_touch_and_go, n_full_stop, n_night_takeoffs, n_night_landings, n_night_full_stop, n_night_touch_and_go, phase_seconds }` |
+| `sortie_acs.tasks_demonstrated[]` | every ACS code that fired with evidence trail |
+| `sortie_acs.scores[]` | V.A / V.B / V.C / V.D performance-standard verdicts |
+| `sortie_acs.currency_events[]` | one entry per takeoff and per landing, tagged `night` per FAR 61.57(b) sunrise/sunset |
+| `sortie_max_pop_segment` | the loudest 30 s window (literal slice of sortie_path) |
+
+`sortie_acs` is `null` when acsML is unavailable or the sortie has
+< 30 real points. `sortie_path_throttle[i]` is `null` for repaired
+points, engineless types, and where no prior real fix exists within
+60 s. Both rules are documented under `sortie_evaluation_rules.guarantees`.
+
+### Recipe 2 — drill into ONE flight's ACS detail
+
+```sh
+# Take a sortie's sortie_path and POST it back to /api/acs-ml/identify
+# for the most detailed output (every evidence field, every score
+# dimension, every currency event):
+
+curl -X POST 'https://web-app-production-fedf.up.railway.app/api/acs-ml/identify' \
+  -H 'Content-Type: application/json' \
+  -d @flight.json   # { "points": [{lat,lon,altMslFt,tsUnix}, ...], "typeCode": "C172", "tail": "N1094F" }
+```
+
+The standalone endpoint returns the SAME shape as `sortie_acs` but
+fed by your own points (e.g. the on-disk yearly archive via
+`/identify-archive` with `t0Seconds`). Useful for backtests or for
+running acsML against tracks that aren't going through the sortie
+extractor.
+
+### Recipe 3 — purpose alone (no ACS detail)
+
+```sh
+curl -X POST 'https://web-app-production-fedf.up.railway.app/api/purpose-ml/classify' \
+  -H 'Content-Type: application/json' \
+  -d '{"points":[...],"typeCode":"C172","tail":"N1094F"}'
+# → { "purpose": "pattern_solo", "confidence": 0.8, "reasons": [...] }
+```
+
+Or pull from `/api/flights/current` — every row carries `purpose` +
+`purpose_source ∈ {"special_use","type","tracked","shape","fallback"}`.
+
+### Recipe 4 — answer "is this aircraft currency-current?"
+
+The library doesn't run the 90-day window for you — currency is
+per-pilot, not per-tail. But you can roll up the events for an
+aircraft to estimate:
+
+```js
+// Sum currency_events across last 90 days of sorties for one tail
+const cutoff = Date.now()/1000 - 90 * 86400
+const day  = sorties.flatMap(s => s.sortie_acs?.currency_events || [])
+  .filter(e => e.rule === '61.57(a)' && e.kind === 'landing' && e.ts > cutoff)
+const night = day.filter(e => e.night && e.full_stop)
+console.log(`Day 90-day landings: ${day.length}  (≥3 for §61.57(a))`)
+console.log(`Night 90-day full-stop landings: ${night.length}  (≥3 for §61.57(b))`)
+```
+
+The library labels each event with the right rule code — your client
+just sums.
+
+### Recipe 5 — find practice flights that exceeded ACS standards
+
+```js
+const trainingFlights = sorties.filter(s =>
+  s.sortie_acs?.scores?.some(sc => sc.verdict === 'outside_standard'))
+for (const s of trainingFlights) {
+  for (const sc of s.sortie_acs.scores) {
+    if (sc.verdict === 'outside_standard') {
+      console.log(`${s.sortie_tail} ${sc.code} score=${sc.score}: ${sc.reasons.join('; ')}`)
+    }
+  }
+}
+// e.g. N1094F V.A score=50: bank: 62° vs 45°; turn_amount: 281° vs 360°
+//      N1094F V.C score=67: squareness_at_reference: 61° spread
+```
 
 ### From a Node module (no HTTP)
 
 ```js
-import { identifyOneTrack } from './acsML/index.js'
+import { classifyOneTrack as purposeClassify } from './purposeML/index.js'
+import { identifyOneTrack as acsIdentify }      from './acsML/index.js'
 
-const points = [
-  { lat: 40.04, lon: -105.23, altMslFt: 8000, tsUnix: 1779200000 },
-  // ...
-]
-const result = identifyOneTrack(points, {
-  typeCode: 'C172', tail: 'N1094F',
-})
-// result.tasks_demonstrated  → [{ code, name, instances, evidence[] }]
-// result.currency_events     → [{ rule, kind, ts, airport, night, ... }]
-// result.scores              → [{ code, score, verdict, breakdown[] }]
-// result.phase_summary       → { n_takeoffs, n_landings, n_full_stop,
-//                                n_night_landings, n_night_full_stop,
-//                                phase_seconds, ... }
-// result.notes               → freeform warnings
+const points = sortiePath
+  .filter(p => p[4] === 'real')                              // ← REAL-only invariant
+  .map(p => ({ lat: p[0], lon: p[1], altMslFt: p[2], tsUnix: Math.floor(p[3]/1000) }))
+
+const purpose = purposeClassify(points, { typeCode, tail, isSchoolFleet })
+const acs     = acsIdentify    (points, { typeCode, tail })
 ```
 
-### From HTTP (the new endpoints)
+Both libraries:
+- Take the canonical `{ lat, lon, altMslFt, tsUnix }` point shape
+- Return a deterministic JSON object — no side effects, no I/O
+- Cost ~5-40 ms per flight depending on track length
+- Are optional in the build (`requireOpt` pattern in
+  [vite.config.js](web/vite.config.js))
 
-```sh
-# Liveness
-curl https://web-app-production-fedf.up.railway.app/api/acs-ml/health
+### Standalone endpoints reference
 
-# Get the full Private Pilot ACS + 14 CFR §61.57 spec JSON
-curl https://web-app-production-fedf.up.railway.app/api/acs-ml/standards
+| Method | Path | Returns |
+|---|---|---|
+| GET | `/api/purpose-ml/health` | `{ ok, version }` |
+| GET | `/api/purpose-ml/buckets` | all 14 possible purpose labels |
+| POST | `/api/purpose-ml/classify` | `{ purpose, confidence, reasons[] }` |
+| POST | `/api/purpose-ml/classify-archive` | same, from 4-tuple + t0Seconds |
+| POST | `/api/purpose-ml/extract` | full feature vector only |
+| GET | `/api/acs-ml/health` | `{ ok, version }` |
+| GET | `/api/acs-ml/standards` | Private Pilot ACS + FAR 61.57 JSON |
+| POST | `/api/acs-ml/identify` | `{ tasks_demonstrated, scores, currency_events, phase_summary, notes }` |
+| POST | `/api/acs-ml/identify-archive` | same, from 4-tuple + t0Seconds |
 
-# Classify one flight (canonical {lat, lon, altMslFt, tsUnix} points)
-curl -X POST \
-  -H 'Content-Type: application/json' \
-  -d '{"points":[...],"typeCode":"C172","tail":"N1094F"}' \
-  https://web-app-production-fedf.up.railway.app/api/acs-ml/identify
+All endpoints are CORS-open JSON, no auth, stateless. Each call is a
+pure function of its input.
 
-# Classify one flight from the on-disk yearly archive (4-tuples + t0)
-curl -X POST \
-  -H 'Content-Type: application/json' \
-  -d '{"points":[[40.04,-105.23,8000,12345],...],"t0Seconds":1767225600,"typeCode":"C172"}' \
-  https://web-app-production-fedf.up.railway.app/api/acs-ml/identify-archive
-```
+### Reading the audit trails
 
-### From the existing `/api/flights/current` (planned)
+Every result carries a `reasons[]` (purposeML) or per-task
+`evidence[]` (acsML) you can inspect when a verdict surprises you.
 
-The follow-on work is to extend `resolvePurposeWithShape` →
-`resolveFlightTags` so every `/api/flights/current` row carries:
+- **purposeML reasons**: which rule fired, e.g. `"touch_and_go +
+  landed_full_stop = 24 ≥ 3 (phaseML)"`. If wrong, the rule's
+  threshold needs tuning.
+- **acsML evidence**: which phaseML/acsML detector fired, with
+  timestamp, duration, confidence, explanation, and now (v0.4)
+  `meanThrottle` + `preEventThrottle`. Distinguishes legitimate IX.A
+  emergency descent (spiraling + idle throttle) from an airline
+  routine descent (straight + cruise throttle).
+- **acsML scores**: each dimension lists target, observed,
+  tolerance, deviation, met. If `met: false`, `reasons[]` summarises
+  why.
 
-```json
-{
-  "tail": "...", "type": "...", "purpose": "pattern_solo", "purpose_source": "shape",
-  "acs": {
-    "tasks_demonstrated": [{ "code": "V.A", "name": "Steep Turns", "instances": 1 }, ...],
-    "scores": [{ "code": "V.A", "score": 50, "verdict": "outside_standard" }, ...],
-    "phase_summary": { "n_landings": 26, "n_full_stop": 0, "n_night_full_stop": 0 },
-    "currency_events_today": 28
-  }
-}
-```
+### Versions in flight today
 
-Not landed yet — that's the next deliverable below.
+| Library | Version | Surfaces |
+|---|---|---|
+| phaseML | inherited port | per-sample phases + 12 maneuver detectors |
+| purposeML | v0.2 (compose phaseML) | resolvePurposeWithShape + standalone API |
+| acsML | v0.5 (sortie-wired) | sortie_acs + standalone API |
+
+`/api/acs-ml/health` and `/api/purpose-ml/health` return the running
+version.
 
 ---
 
