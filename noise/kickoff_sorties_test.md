@@ -26,6 +26,7 @@ enough captured points (≥ 30 fixes, ≥ 5 min active wall-clock).
 | Sortie counts (landings, full_stop, night) | ✅ v0.2 live | `result.phase_summary` has n_takeoffs / n_landings / n_full_stop / n_touch_and_go / n_night_takeoffs / n_night_landings / n_night_full_stop / n_night_touch_and_go |
 | FAR 61.57(c) instrument currency | ❌ deferred | needs approach-profile + runway alignment data |
 | Wire ACS into `/api/sorties` row | ✅ v0.5 live | `sortie_acs` field on every sortie with ≥ 30 real points |
+| Data-quality contract (quality + sanity gates on library inputs) | ✅ v0.6 live | `inputToPointsWithStats` in both libs + `pointsToPurposeMLShape` defended. HTTP responses carry `input_filter: { kept, dropped: { quality, sanity, malformed } }`. See round-6 notes. |
 | Wire ACS into `/api/flights/current` row | 🔨 pending | follow-on (see Open work below) |
 | Kiosk display of purpose + reg | 🔨 pending | follow-on |
 
@@ -481,6 +482,101 @@ GET /api/sorties?airport=KLMO&day=2026-04-19&tail=N1094F
 sortie-merge rule (5-min ground threshold) collapses many T&Gs
 within the lesson into one sortie. The phase_summary counts surface
 the full sub-event story while keeping the per-sortie row clean.
+
+---
+
+## 2026-06-01 20:50 — round 6: data-quality contract for phaseML
+
+Operator: "can we ensure that phaseML is consuming high quality
+data?"
+
+Audit found one real risk:
+
+  **The library input adapters (`purposeML/service.js` and
+  `acsML/service.js` `inputToPoints`) accepted sortie_path-style
+  5-tuples `[lat, lon, alt, ts, quality]` but silently dropped the
+  5th slot.** If a future caller passed the raw `sortie_path` array
+  (which mixes `quality: "real"` and `quality: "repaired"`),
+  bridged/synthesized points would have been fed to the classifier
+  unfiltered. The current callers (sortiesPlugin, vite.config.js)
+  all filter upstream — but the libraries were not defending
+  themselves.
+
+Fixed all three input adapters with two gates:
+
+  - **QUALITY gate** — when a tuple's 5th slot is present, drop
+    unless it's `"real"` or `"observed"`. Object inputs with a
+    `quality` field are gated the same way. Missing quality field
+    means "no information — trust" (raw archive / live record).
+
+  - **SANITY gate** — drop fixes that can't physically be in
+    flight:
+      lat ∉ [-90, 90]
+      lon ∉ [-180, 180]
+      altMslFt non-finite, < -1000 ft, or > 65000 ft
+      tsUnix non-finite, ≤ 0, or > now + 1 day
+
+Defensive depth: each library checks its own inputs. The classifier
+still owns its own min-points / min-duration thresholds (≥30 fixes,
+≥5 min active wall-clock) — quality+sanity is a layer below that.
+
+### Diagnostics
+
+`/api/purpose-ml/classify` and `/api/acs-ml/identify` now return
+`input_filter` so consumers see when filtering kicked in:
+
+```json
+{
+  "purpose": "pattern_solo",
+  "confidence": 0.8,
+  "reasons": [...],
+  "input_filter": {
+    "kept": 158,
+    "dropped": { "quality": 3, "sanity": 0, "malformed": 0 }
+  }
+}
+```
+
+If `kept` ends up < 2 after filtering, the endpoints return `400`
+with the dropped counts so the caller knows the input was unusable
+rather than silently empty.
+
+For in-process use, `inputToPointsWithStats(raw, opts)` returns
+`{ points, dropped }` for the same diagnostics.
+
+### Smoke-tested
+
+```
+Input: 7 tuples — 1 quality='repaired' + 3 sanity-violations
+                  (lat=999, alt=99999, ts=0)
+                  + 3 good (1 four-tuple no-quality, 2 five-tuple real)
+
+inputToPointsWithStats →
+  kept: 3
+  dropped: { quality:1, sanity:3, malformed:0 }
+```
+
+### Default behaviour: quality through phaseML's own gates
+
+phaseML itself defends against time gaps: `MAX_SAMPLE_GAP_S = 120 s`
+in [phaseML/features.js](web/phaseML/features.js) marks any
+inter-fix gap > 2 min as `isSessionBreak`, and every detector
+respects breaks. So even garbage timestamps (which would produce
+huge inter-fix dt's) get caught BEFORE feeding maneuver detection.
+The new quality+sanity gates layer on top of that, not under.
+
+### Status
+
+| Caller | Quality-filter status |
+|---|---|
+| `sortiesPlugin.js` purposeML + acsML | ✅ filters `quality === 'real'` before calling |
+| `sortiesPlugin.js` throttle estimate | ✅ stores `null` at non-real indices |
+| `vite.config.js` resolvePurposeWithShape | ✅ `pointsToPurposeMLShape` gates added |
+| `vite.config.js` `classifyOneTrack` for phase string | ✅ builds from raw `pts` (no bridged) |
+| `/api/purpose-ml/classify` HTTP | ✅ library adapter gates |
+| `/api/acs-ml/identify` HTTP | ✅ library adapter gates |
+
+No silent ingestion of bridged data anywhere.
 
 ---
 
