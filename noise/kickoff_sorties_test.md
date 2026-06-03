@@ -25,6 +25,7 @@ enough captured points (≥ 30 fixes, ≥ 5 min active wall-clock).
 | FAR 61.57(b) night currency | ✅ v0 live | uses NOAA sunrise/sunset (`acsML/suntimes.js`) at airport lat/lon |
 | Sortie counts (landings, full_stop, night) | ✅ v0.2 live | `result.phase_summary` has n_takeoffs / n_landings / n_full_stop / n_touch_and_go / n_night_takeoffs / n_night_landings / n_night_full_stop / n_night_touch_and_go |
 | FAR 61.57(c) instrument currency | ❌ deferred | needs approach-profile + runway alignment data |
+| Wire ACS into `/api/sorties` row | ✅ v0.5 live | `sortie_acs` field on every sortie with ≥ 30 real points |
 | Wire ACS into `/api/flights/current` row | 🔨 pending | follow-on (see Open work below) |
 | Kiosk display of purpose + reg | 🔨 pending | follow-on |
 
@@ -429,6 +430,57 @@ real-instrument data we don't have.
 Turns — ACS doesn't specify a throttle target but instructors
 expect power-on-then-back-to-cruise. We can add that to the V.A
 scorer if it's wanted; for v0 we left scoring throttle-blind.
+
+---
+
+## 2026-06-01 20:10 — sortie_acs wired into /api/sorties
+
+Operator: "let's ensure it is available in sorties." Done.
+
+[sortiesPlugin.js](web/sortiesPlugin.js):
+- New `getAcsMLIdentify()` lazy loader (mirrors the existing
+  `getPurposeMLClassify()`). Missing acsML → `sortie_acs: null`,
+  no crash.
+- Runs `acsMLIdentifyFn` on the SAME real-only points filter
+  purposeML uses. Skips if < 30 real points (acsML's own minimum).
+- New `sortie_acs` field on every sortie row:
+  ```json
+  {
+    "tasks_demonstrated": [{ "code", "name", "instances", "evidence" }, ...],
+    "scores":             [{ "code", "score", "verdict", "breakdown", "reasons" }, ...],
+    "currency_events":    [{ "rule", "kind", "ts", "airport", "night", ... }, ...],
+    "phase_summary":      { "n_takeoffs", "n_landings", "n_full_stop",
+                            "n_touch_and_go", "n_night_takeoffs",
+                            "n_night_landings", "n_night_full_stop",
+                            "n_night_touch_and_go", "phase_seconds", "total_active_s" },
+    "notes":              [...]
+  }
+  ```
+- Response metadata extended:
+  - `sortie_acs_classifier` line announces availability + the
+    real-only / ≥ 30 pts rule
+  - `sortie_evaluation_rules.guarantees.sortie_acs` documents the
+    invariant (computed from real-only points; throttle from
+    `sortie_path_throttle` drives the VII.B/VII.C/IX.A/IX.B
+    selectors per round-4 spec)
+
+Smoke-tested on N1094F's Sunday 2026-04-19 sortie at KLMO:
+```
+GET /api/sorties?airport=KLMO&day=2026-04-19&tail=N1094F
+→ sortie_count: 1
+  sortie_acs:
+    phase_summary: { n_takeoffs:1, n_landings:37, n_touch_and_go:36, n_full_stop:1 }
+    tasks_demonstrated: III.B, IV.A, IV.B, IV.F ×3, IV.K ×36,
+                        V.A, V.C ×2, VII.A
+    currency_events: 38
+    scores: V.A=50 (outside_standard, bank+amount fail),
+            V.C=67 (outside_standard, squareness fail)
+```
+
+37 landings on a single training sortie because the operator's
+sortie-merge rule (5-min ground threshold) collapses many T&Gs
+within the lesson into one sortie. The phase_summary counts surface
+the full sub-event story while keeping the per-sortie row clean.
 
 ---
 
