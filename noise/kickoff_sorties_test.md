@@ -486,6 +486,99 @@ the full sub-event story while keeping the per-sortie row clean.
 
 ---
 
+## 2026-06-03 — round 10: task-applicability gates (per curated-case review)
+
+Operator shared a curated list of "one representative per task"
+showing detected maneuvers that needed review:
+
+| Task | Tail · Type | Issue |
+|---|---|---|
+| III.B Traffic Patterns | N26GG · AS26 | glider in pattern — OK (gliders do fly published patterns) |
+| V.A Steep Turns | N2471W · GLID | glider thermalling LOOKS like steep turn |
+| V.C S-Turns Across a Road | N2471W · GLID | inter-thermal traverse mimics S-turns |
+| V.D Turns Around a Point | N4593Y · PA25 | tow plane post-release spiral, not training |
+| VII.A Slow Flight | N963CG · JS1J | glider cruise IS perpetually slow |
+| VII.B Power-Off Stalls | N4337Y · PA25 | tow plane post-release dive ≠ stall |
+| VII.C Power-On Stalls | N94RH · VENT | engineless — no power to apply |
+| IX.A Emergency Descent | N6719Z · PA25 | tow plane post-release dive ≠ emergency |
+| IV.A / IV.B / IV.E / IV.K | varies | all OK — keep |
+
+Root issue: phaseML's maneuver detectors fire on the right *track
+shapes*, but the ACS task they map to doesn't apply to that
+*airframe role*. Private Pilot Airplane ACS (FAA-S-ACS-6B) doesn't
+cover gliders (own ACS) or describe tow-plane post-release energy
+management.
+
+### Fix — applicability gate in identifier.js
+
+Added a `TASK_EXCLUSIONS` table — each row is one (task code, type
+bucket) pair with a documentation string for the reasoning:
+
+```js
+{ task: 'V.A',   match: 'engineless', why: 'thermalling produces continuous tight banked turns; ACS V.A is one 360° (or 180°+180°)' },
+{ task: 'V.C',   match: 'engineless', why: 'inter-thermal traverses LOOK like S-turns across a road but the task is for powered ground reference' },
+{ task: 'V.D',   match: 'engineless', why: 'thermalling = continuous orbit; not a ground-reference maneuver' },
+{ task: 'VII.A', match: 'engineless', why: 'glider normal cruise is 40-60 KTAS — perpetually below typical powered-plane cruise' },
+{ task: 'VII.B', match: 'engineless', why: 'engineless — no power-off vs power-on distinction' },
+{ task: 'VII.C', match: 'engineless', why: 'engineless — no power to apply at stall break' },
+{ task: 'IX.A',  match: 'engineless', why: 'gliders descend by design — every flight is a descent' },
+
+{ task: 'V.D',   match: 'tow_plane',  why: 'post-release descent often spirals over the field; not a training maneuver' },
+{ task: 'VII.B', match: 'tow_plane',  why: 'post-release dive at idle has stall-recovery-like signature but is intentional' },
+{ task: 'IX.A',  match: 'tow_plane',  why: 'post-release dive at 1500-2500 fpm with bank is intentional energy management' },
+```
+
+When a detection would map to an excluded (task, type) pair, the
+identifier SKIPS the task assignment. The underlying phaseML
+detection still fires (we don't lie about what's happening
+kinematically) — we just don't promote it to an ACS task that
+doesn't apply.
+
+### Bonus fix — AS50 helicopter mis-tagged engineless
+
+While testing, found that `/^AS\d/` matched both Schleicher
+gliders (AS21, AS26, AS31) AND Aerospatiale helicopters (AS50,
+AS55, AS65). Tightened to `/^AS[1-3]\d/` — matches AS10-AS39
+gliders but not AS40+ helicopters. The AS32/AS-332 Super Puma
+collision (Schleicher ASK-32 vs Aerospatiale AS-332) is accepted
+in favor of common gliders being tagged correctly.
+
+### Diagnostic surface
+
+When the gate fires, `sortie_acs.notes[]` carries:
+```
+"type-applicability: skipped V.A=1, V.C=1 for type GLID
+ (see TASK_EXCLUSIONS)"
+```
+
+Consumers can surface this to explain why a curated review case
+doesn't show up anymore.
+
+### Verified all curated cases
+
+| Curated tail / type | Before | After |
+|---|---|---|
+| N2471W GLID | V.A + V.C false-positive | V.A + V.C skipped, III.B kept |
+| N4593Y PA25 | V.D false-positive | V.D skipped (when it fires) |
+| N963CG JS1J | VII.A false-positive | VII.A skipped |
+| N4337Y PA25 | VII.B false-positive | VII.B skipped |
+| N94RH VENT | VII.C false-positive | VII.C skipped |
+| N6719Z PA25 | IX.A false-positive | IX.A skipped (verified on F1 + F2) |
+| N1094F C172 (control) | unchanged | unchanged ✓ |
+
+### What we deliberately DID NOT exclude
+
+- **PA25/PA18 VII.A Slow Flight**: tow planes climb slowly with a
+  glider on the line — phaseML fires VII.A. We left it in
+  because a CFI giving a tow-plane checkride could legitimately
+  practice slow flight. Consumers can filter by purpose if needed.
+- **AS50 helicopter VII.A**: helicopters cruise slowly. Same
+  reasoning. None of the airplane ACS tasks applies to
+  helicopters strictly, but we don't have a helicopter ACS
+  encoded yet. Helicopter exclusions are a follow-on.
+
+---
+
 ## 2026-06-01 22:00 — round 9: landing-event dedup
 
 Operator: "I am a bit concerned that go-around is detecting more
