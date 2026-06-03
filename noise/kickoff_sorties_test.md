@@ -27,6 +27,7 @@ enough captured points (≥ 30 fixes, ≥ 5 min active wall-clock).
 | FAR 61.57(c) instrument currency | ❌ deferred | needs approach-profile + runway alignment data |
 | Wire ACS into `/api/sorties` row | ✅ v0.5 live | `sortie_acs` field on every sortie with ≥ 30 real points |
 | Data-quality contract (quality + sanity gates on library inputs) | ✅ v0.6 live | `inputToPointsWithStats` in both libs + `pointsToPurposeMLShape` defended. HTTP responses carry `input_filter: { kept, dropped: { quality, sanity, malformed } }`. See round-6 notes. |
+| Climb metrics (initial climb / peak alt / climb cycles) | ✅ v0.8 live | `acsML/climbMetrics.js` — `phase_summary.initial_climb[]`, `peak_alt`, `climb_cycles[]` (release_msl/agl_ft, climb_active_s, avg_climb_rate_fpm). Tow-only consumers filter by sortie_purpose. See round-8 notes. |
 | Wire ACS into `/api/flights/current` row | 🔨 pending | follow-on (see Open work below) |
 | Kiosk display of purpose + reg | 🔨 pending | follow-on |
 
@@ -482,6 +483,116 @@ GET /api/sorties?airport=KLMO&day=2026-04-19&tail=N1094F
 sortie-merge rule (5-min ground threshold) collapses many T&Gs
 within the lesson into one sortie. The phase_summary counts surface
 the full sub-event story while keeping the per-sortie row clean.
+
+---
+
+## 2026-06-01 21:40 — round 8: climb metrics (initial climb + tow / practice cycles)
+
+Operator: "for tow flights, we want to enrich with avg rate of
+climb and point of release (highest altitude). for all aircraft
+we want to capture the initial rate of climb (use phaseML?)"
+
+Built [acsML/climbMetrics.js](web/acsML/climbMetrics.js) on top of
+phaseML's enriched VS series (so smoothing comes for free). Three
+new fields land on every `sortie_acs.phase_summary`:
+
+### `initial_climb[]` — every aircraft, one entry per takeoff
+
+```json
+{
+  "ts": 1779200000,
+  "mean_fpm": 442,    // mean smoothed VS over first 60 s after takeoff
+  "peak_fpm": 804,    // max VS in the same window
+  "duration_s": 56,   // actual window length (capped by track end)
+  "sample_count": 13,
+  "airport": "KBJC",
+  "implied": false
+}
+```
+
+Window: 60 s starting at each takeoff event (observed OR implied
+per round-7 rules). Honest empty array when no takeoff was
+detected — e.g. PA18 entering the capture radius already at
+altitude has no initial-climb data.
+
+### `peak_alt` — every sortie
+
+The highest fix in the sortie, tagged with the nearest known
+airport for AGL reference:
+
+```json
+{
+  "ts": 1779228410,
+  "msl_ft": 8400,
+  "agl_ft": 3270,
+  "nearest_airport": "KEIK",
+  "lat": 40.07648,
+  "lon": -105.08905
+}
+```
+
+### `climb_cycles[]` — tow + GA practice climbs share this shape
+
+Each climb-then-descent ≥ 1500 ft alt gain. Surfaced HONESTLY as
+`climb_cycles` because the same shape matches both tow operations
+AND GA practice climbs (climb to practice area → maneuver →
+descend → repeat). Tow-only consumers should filter by purpose /
+type code:
+
+```js
+const towOnly = (sortie.sortie_purpose === 'tow_plane'
+                 || /^(PA25|PA18|PIAT|PC6)$/.test(sortie.sortie_type))
+  ? sortie.sortie_acs.phase_summary.climb_cycles : []
+```
+
+Cycle payload:
+
+```json
+{
+  "cycle_start_ts": 1779225000,
+  "release_ts":     1779225300,
+  "release_msl_ft": 7275,
+  "release_agl_ft": 1987,              // above nearest airport's field elev
+  "climb_origin_msl_ft": 5300,
+  "climb_alt_gain_ft":   1975,
+  "climb_duration_s":     300,         // wall-clock start-of-climb to release
+  "climb_active_s":       280,         // ACTIVE climbing only (excludes cruise plateaus + ADS-B gaps)
+  "avg_climb_rate_fpm":   423,         // over climb_active_s, not wall-clock
+  "release_lat": 40.165,
+  "release_lon": -105.16,
+  "nearest_airport": "KLMO"
+}
+```
+
+Why `climb_active_s` matters: a real tow climb often includes
+cruise plateaus (configure → climb → cruise → climb → cruise to
+release) and may be punctuated by ADS-B coverage gaps. Wall-clock
+average dilutes the rate; active-climbing average reflects what
+the tow plane was actually doing while climbing.
+
+### Detector gates
+
+- Climb gain ≥ **1500 ft** — filters pattern laps (which gain
+  800-1000 ft to TPA)
+- Climb wall-clock ≥ **180 s** — filters quick pattern wobbles
+- Mean VS during ACTIVE climbing samples > **300 fpm**
+- Descent of ≥ 1500 ft must follow the peak (otherwise mid-cruise
+  oscillation, not a release)
+- Local max detection works ACROSS session-break samples
+  (otherwise the PA18 tow whose release sits right after a 10-min
+  ADS-B coverage gap is missed)
+
+### Measured (2026-04-19 day, real flights)
+
+| Tail | Type | Purpose | Result |
+|---|---|---|---|
+| N2456J F2 | PA18 | tow plane | 1 cycle, release **4846 AGL**, 3400 ft gain, 417 fpm active |
+| N1812E F1 | C172 | tow plane | **23 cycles**, releases 1962-1987 AGL, 432-440 fpm active, ~5 min climbs each |
+| N1094F F2 | C172 | training | 6 cycles, releases 2012 AGL, 1800 ft gain, 441 fpm. Honest: these are practice climbs, NOT tow ops. Consumer filters by purpose. |
+| N456WN | B737 | airliner transit | 0 cycles (correct — descended only, no climb-then-descent pattern) |
+
+The PA18 single-tow case at 4846 AGL was specifically the test the
+operator wanted to capture. It does.
 
 ---
 
