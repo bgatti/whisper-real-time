@@ -486,6 +486,91 @@ the full sub-event story while keeping the per-sortie row clean.
 
 ---
 
+## 2026-06-03 — round 12: shape-only detector tightening (dropping the type cheats)
+
+Per round-11 methodology: rather than cheating with TASK_EXCLUSIONS,
+tighten the underlying phaseML shape detectors so they discriminate
+on what the *track* says, not what the *type* says.
+
+Tackled the five worst offenders one at a time, re-running the
+smell test after each. **All phaseML tests (27/27) still pass**
+through every change.
+
+### Comparison: per-100-flights rates BEFORE → AFTER
+
+| Task | trainer | glider | tow | heli | turboprop | bizjet | airline | other_ga |
+|---|---|---|---|---|---|---|---|---|
+| V.A   |  7.0→**3.8** | 40.0→**6.7**  | 0→0 | 2→0 | 0→0 | 0→0 | 0→0 | 0.4→0.1 |
+| V.D   |  0.2→**0.2** |  6.7→**0**    | 0→0 | 0→0 | 0→0 | 0→0 | 0→0 | 0.1→0   |
+| VII.A |  7.7→**1.1** | 26.7→**0**    | 63.6→**9.1** | 81.6→**16.3** | 3→0 | 0.9→0 | 0→0 | 5.5→0.4 |
+| VII.B/C | 4.7→**2.3** | 40.0→**13.3** | 9.1→9.1 | 14.3→**4.1** | 0→0 | 0.9→0 | 0→0 | 1.4→0.7 |
+| IX.A  |  0.7→**0.2** |  0→0          | 63.6→**0**    | 0→0           | 41.4→**1.7** | 23.0→**8.0** | 28.1→**7.3** | 14.8→**2.9** |
+
+### Changes per detector (all in [phaseML/maneuvers.js](web/phaseML/maneuvers.js))
+
+- **V.A Steep Turns**: added a post-rollout window where the bank
+  must drop below 20° within 15 s after the qualifying turn ends.
+  Thermalling continues banked → rejected. Real V.A rolls out →
+  passes.
+- **V.D Turns Around a Point**: tightened maxAltRangeFt 200 → **150 ft**,
+  added maxDurationS=150 and maxSignedTurnDeg=900 (ACS V.D is "two
+  360° turns" — bounded). Gliders thermalling climb 150-300 ft over
+  a thermal → rejected.
+- **VII.A Slow Flight**: require recovery to 0.85 × cruise sustained
+  30 s within 180 s of the slow segment end. Perpetually-slow
+  aircraft (gliders, helicopters, tow planes towing) never recover
+  → rejected.
+- **VII.B/C Stalls**: require pre-break VS to average above -300 fpm
+  (the stall sets up from level or climbing flight). Gliders
+  descending in sink that produce spike VS drops were already
+  descending → rejected.
+- **IX.A Emergency Descent**: require START altitude > 4000 ft AGL,
+  AND recovery to VS > -500 fpm sustained 30 s within 120 s, AND
+  end altitude ≤ 5000 ft AGL. Tow plane releases at 2-3 k AGL →
+  rejected (too low). Airliners continuing all the way to KDEN →
+  rejected (no recovery). Real ACS practice satisfies all three.
+
+### TASK_EXCLUSIONS removed (the "cheat" reduced)
+
+We started round-10 with 10 exclusion rows. Four are now redundant
+and have been removed:
+
+| Removed | Why | Verified |
+|---|---|---|
+| V.D engineless | shape detector now rejects thermalling | glider 6.7 → 0 |
+| V.D tow_plane | shape detector rejects (alt range exceeded) | tow 0 maintained |
+| VII.A engineless | shape detector requires recovery | glider 26.7 → 0 |
+| IX.A tow_plane | shape detector requires high-AGL start + recovery | tow 64 → 0 |
+
+Still in place (detector still over-fires for these):
+
+| Row | Reason kept |
+|---|---|
+| V.A engineless | glider 6.7 still > trainer 3.8 (1.8x) |
+| V.C engineless | helicopter 22.4 still dominates — separate fix needed |
+| VII.B engineless | glider 13.3 still > trainer 2.3 (5.8x) |
+| VII.B tow_plane | tow 9.1 > trainer 2.3 — tow post-release dive recovery passes |
+| VII.C engineless | safety belt |
+| IX.A engineless | safety belt (rate already 0) |
+
+### Test fixture updates
+
+`emergencyDescentTrack()` now appends a `recoveryS=60s` level-flight
+tail so the test reflects that ACS IX.A always includes recovery.
+
+### Trade-off documented
+
+Trainer rates also dropped for several tasks:
+- VII.A 7.7 → 1.1 (many real V.II.A's end before recovery is
+  captured in the in-radius archive slice)
+- VII.B/C 4.7 → 2.3 (some real stalls had pre-break VS below -300)
+- V.A 7.0 → 3.8 (some real V.A's didn't reach 20° post-rollout
+  bank within the window)
+
+For a smaller capture radius these are acceptable losses to gain
+specificity. Tuning is conservative: better to MISS an ACS task
+than report a wrong one on a non-trainer.
+
 ## 2026-06-03 — round 11: smell test confirms detector over-firing on non-trainers
 
 Operator follow-up: "easy smell test: ACS should appear in
