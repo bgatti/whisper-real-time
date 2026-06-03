@@ -486,6 +486,72 @@ the full sub-event story while keeping the per-sortie row clean.
 
 ---
 
+## 2026-06-03 — round 13: boundary-conditions sortie split (N52993 case)
+
+Operator queried N52993 (Journeys Aviation C172 at KBDU) sorties
+for today, surfaced a 127.7-min "sortie" containing a 4322 s
+(72 min) unbridged gap. The bracketing fixes told the whole
+story:
+
+  BEFORE 14:31:37 — KBDU 1.8 nm, 625 ft AGL (descending to land)
+  AFTER  15:43:39 — KBDU 0.8 nm, 325 ft AGL (just took off)
+  → 72 min of zero samples between them
+
+Operator: "Looks like two sorties to me. Use boundary conditions
+to bridge sorties."
+
+### Audit context
+
+Real quick-turn ground times on this same day (between distinct
+detected sorties) clustered at **105-135 s** (1:45 → 2:15). So
+the existing 5-min `SORTIE_GROUND_MS` was the right ballpark for
+the merge threshold; the bug was that the alt-state walk **never
+saw a transition** in the 72-min gap (no samples at all). The
+session never closed.
+
+### Fix in [sortiesPlugin.js](web/sortiesPlugin.js) `detectSortiesInTrack`
+
+```
+SORTIE_LONG_GAP_BREAK_MS         = 10 * 60_000   // 10 min
+SORTIE_BOUNDARY_NEAR_AIRPORT_NM  = 3
+SORTIE_BOUNDARY_MAX_AGL_FT       = 1500
+```
+
+When two consecutive accepted fixes have `dt > 10 min` AND BOTH
+are within 3 nm of the home airport at < 1500 ft AGL, close the
+current airborne session at the previous fix. The current fix
+opens a new session; existing merge logic then decides whether
+to keep them separate (almost always yes for these long gaps).
+
+10 min threshold derived from THIS DATA: well above the 1:45 -
+2:15 quick-turn ceiling, well below the 72-min gap. 3 nm + 1500
+AGL: pattern area criteria — both fixes must look like "just
+landed" or "just took off." A mid-cruise coverage gap at 6000
+AGL six miles from the field doesn't qualify.
+
+### Plumbing
+
+```
+detectSortiesInTrack(samples, ceil, ms, hardBoundaries, homeAp)
+  homeAp = { lat, lon, fieldElevFt }
+```
+
+Both callers (`/api/sorties` main + `/api/sorties/busiest-days`)
+pass the resolved sortie airport. When the split fires,
+`sortie_boundary_source = "boundary_long_gap"` on the wire.
+
+### Verified on N52993 2026-06-03
+
+| Before fix | After fix |
+|---|---|
+| 4 sorties | **5 sorties** |
+| S1 = 127.7 min (KLMO + KBDU in one bucket) | S1 = 53.9 min (KLMO practice) + S2 = 1.7 min (brief final pattern), split at the 4322 s gap |
+| S1 had unbridged 4322 s + 170 s + ... internal | S1 keeps the 170 s mid-cruise gap (6+ nm from KBDU at 3000+ AGL — correctly NOT split) |
+
+All tests still pass (phaseML 27/27, resolvePurposeWithShape 18/18).
+
+---
+
 ## 2026-06-03 — round 12: shape-only detector tightening (dropping the type cheats)
 
 Per round-11 methodology: rather than cheating with TASK_EXCLUSIONS,
