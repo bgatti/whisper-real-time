@@ -16,9 +16,13 @@ enough captured points (≥ 30 fixes, ≥ 5 min active wall-clock).
 |---|---|---|
 | Purpose, per-flight | ✅ live | `purposeML/classifier.js` via `resolvePurposeWithShape` in [vite.config.js](web/vite.config.js) |
 | Purpose, per-tail (multi-day rollup + FAA registry) | ⚠ offline only | `purposeML/experiments/deep_dive.mjs` |
-| ACS task identification | ✅ v0 live | `acsML/identifier.js` + `/api/acs-ml/identify` endpoint |
+| ACS task identification | ✅ v0.3 live | `acsML/identifier.js` + `/api/acs-ml/identify` endpoint — covers III.B / IV.A,B,E,F,K / V.A,B,C,D / VII.A,B,C / VIII.E / IX.A,B / XI.A |
+| IX.B Emergency Approach (simulated) detector | ✅ v0.3 live | `acsML/features.js` `detectEmergencyApproach` — descent < 800 AGL away from airport with climb-out recovery |
+| ACS performance-standard scoring | ✅ v0.2 live | `acsML/scoring.js` (V.A, V.B, V.C, V.D) — `result.scores[]` on each flight |
+| Energy-based glide / power detection | ⚠ v0.3 spec only | `E = ½v² + g·h` decay rate; specced in IX.B notes, not yet implemented |
 | FAR 61.57(a) day currency | ✅ v0 live | `acsML/identifier.js` emits per-takeoff / per-landing events |
 | FAR 61.57(b) night currency | ✅ v0 live | uses NOAA sunrise/sunset (`acsML/suntimes.js`) at airport lat/lon |
+| Sortie counts (landings, full_stop, night) | ✅ v0.2 live | `result.phase_summary` has n_takeoffs / n_landings / n_full_stop / n_touch_and_go / n_night_takeoffs / n_night_landings / n_night_full_stop / n_night_touch_and_go |
 | FAR 61.57(c) instrument currency | ❌ deferred | needs approach-profile + runway alignment data |
 | Wire ACS into `/api/flights/current` row | 🔨 pending | follow-on (see Open work below) |
 | Kiosk display of purpose + reg | 🔨 pending | follow-on |
@@ -186,3 +190,282 @@ Please confirm or correct:
 4. Confirm the file location for `kickoff_sorties_test.md` — I put
    this at `noise/kickoff_sorties_test.md`. Move if needed.
 5. Confirm or substitute the 5 sample tails used in the demo.
+
+---
+
+## 2026-06-01 18:30 — operator feedback round 2 + v0.2 patch
+
+Feedback:
+> steep turns are also right handed.
+> I don't see emergency descent
+> also circle around a point
+> but, this looks great
+> submit to the channel with instruction for use. sorties should
+> include all ACS codes
+> plus counts of landings, landing full stop, and night landings
+> kickoff a side task to score this segments again the ACS standards
+> for speed and altitude deviation, roundness, squareness (cross
+> road at 90)
+
+Assistant actions taken:
+
+1. **Steep turn left vs right** — verified. phaseML's
+   `detectSteepTurn` is symmetric (the `sign` is computed off
+   `turnRateDps > 0 ? 1 : -1` and the explanation says "left" or
+   "right" accordingly). Across the full 2026-04-19 day file
+   (2800 flights), 49 steep turns fired: **29 left, 20 right**.
+   The demo on N1094F flight 6 only happened to capture one steep
+   turn that was a left.
+
+2. **Emergency descent** — also working, but was being grossly
+   overcounted: **531 instances** firing because phaseML's
+   underlying detector triggers on any sustained 1200+ fpm /
+   1200+ ft loss, and routine airline / biz-jet descents into KDEN
+   trip that. ACS IX.A specifically requires the 30-45° bank, so I
+   added a `selector: "spiraling"` field to the JSON spec and the
+   identifier honours it (`evidence.spiraling === true` only).
+   After gating: **531 → 82** instances. Example output now:
+   `"N878UA vs -1399 fpm avg, lost 3000 ft in 130s, spiraled +130°"`
+   — a real spiraling descent.
+
+3. **Turns around a point (V.D)** — already working: 3 instances
+   on the full day file. It's just a rare maneuver (training only,
+   off-airport, over a fixed ground reference). Example:
+   `"~27ced1 orbit at (40.0186, -105.2203), radius ~0.05 nm,
+   centre spread 958 ft"`.
+
+4. **All ACS codes in sorties** — `result.tasks_demonstrated[]`
+   already lists every fired code. Across the day:
+   III.B(652), IV.A(1580), IV.B(538), IV.E(142), IV.F(661),
+   IV.K(1636), IX.A(82), V.A(49), V.C(36), V.D(3), VII.A(135),
+   VII.B(51). V.B Rectangular Course = 0 — this is **correct**:
+   V.B is over a ground reference, not around the runway. Pattern
+   work belongs to III.B which IS firing.
+
+5. **Counts** — added to `result.phase_summary`:
+   - `n_takeoffs`, `n_landings`, `n_touch_and_go`, `n_full_stop`
+   - `n_night_takeoffs`, `n_night_landings`, `n_night_full_stop`,
+     `n_night_touch_and_go`
+   - Existing `phase_seconds` rollup of phaseML per-sample labels
+
+6. **Performance-standard scoring** — built [acsML/scoring.js](web/acsML/scoring.js).
+   For each detected V.A / V.B / V.C / V.D instance, returns:
+   ```json
+   {
+     "code": "V.A", "name": "Steep Turns",
+     "ts": 1779200120, "durationS": 39,
+     "score": 50, "verdict": "outside_standard",
+     "breakdown": [
+       { "dimension": "bank", "target": "45°", "observed": "62°",
+         "tolerance": 5, "deviation": 17, "met": false, "weight": 2 },
+       { "dimension": "altitude_deviation", "target": "±100 ft",
+         "observed": "±75 ft", "tolerance": 100, "deviation": 75,
+         "met": true, "weight": 2 },
+       { "dimension": "airspeed_deviation", "target": "±10 kts",
+         "observed": "±10 kts", "met": true, "weight": 1,
+         "notes": "groundspeed proxy; TAS unavailable from ADS-B" },
+       { "dimension": "turn_amount", "target": "360°", "observed": "281°",
+         "tolerance": 10, "deviation": 79, "met": false, "weight": 1 }
+     ],
+     "reasons": ["bank: 62° vs 45°", "turn_amount: 281° vs 360°"]
+   }
+   ```
+   - **V.A Steep Turns**: bank, altitude, airspeed, turn amount
+   - **V.B Rectangular Course**: corner squareness (each 90° ±10°), altitude
+   - **V.C S-Turns Across a Road**: altitude range, squareness
+     at the reference (perpendicular crossings), leg count
+   - **V.D Turns Around a Point**: roundness (rStd/rMean ≤ 0.15),
+     altitude range, airspeed range
+
+   Sample real result on N1094F flight 6: V.A scored 50 (overbanked
+   at 62°, undershot 360° at 281° — bank and amount NO, alt and speed
+   OK). V.C scored 67 on three instances (altitude held, but
+   squareness 56–61° spread = pilot weaving). Reads like a real
+   student-pilot grade sheet.
+
+   Out-of-scope for v0 scoring (verdict='cannot_score'): IV.B / IV.F
+   landing accuracy (need touchdown-point intent), IV.A / IV.E
+   takeoff (need rotation speed), VII.A slow flight bank target,
+   VII.B/C stall recovery technique.
+
+7. **Instructions for use**: see the **How to use** section just below.
+
+---
+
+## 2026-06-01 18:55 — operator feedback round 3 + IX.B detector
+
+Feedback:
+> Emergency descent, if proper finds best glide and looks for field
+> to land in
+> any descent < 800 feet agl away from airport is a good candidate.
+> should be able to detect idle by calculating flight energy (speed,
+> vs)
+
+Assistant action:
+
+Added [`detectEmergencyApproach`](web/acsML/features.js) mapped to
+ACS **IX.B Emergency Approach and Landing (Simulated)**. v0
+heuristic — straight off the operator's spec:
+
+- Sustained descent (VS ≤ -300 fpm, ≥ 60 s)
+- Ends below 800 ft AGL **AND** more than 3 nm from any known
+  airport
+- Followed by a sustained climb-out (VS ≥ +300 fpm for ≥ 30 s
+  within 90 s of the low point — i.e. the pilot did NOT actually
+  land; they powered up and climbed away)
+- Speed range during the descent < 50 kts (no rapid deceleration
+  that would indicate a different maneuver)
+
+Real example surfaced on the 2026-04-19 day file:
+`"N7206C descent -737 fpm to 427 ft AGL, 9.1 nm from KBJC, gs
+range 38 kts, recovered to climb"` — textbook simulated emergency
+approach. Across the full day, **45 flights** triggered IX.B (1.6%
+of the 2800-flight sample).
+
+**Energy-based refinement (deferred to v0.3):** total mechanical
+energy is `E = ½v² + g·h`. For a power-off glide at best-glide
+speed, energy decays at the drag-limited rate (~3-5 kts equivalent
+altitude per second). When we see energy decay > 6 kts-eq-alt/s
+that's a steeper-than-glide descent (spiraling emergency descent,
+not a glide). When < 1 kts-eq-alt/s the engine is still producing
+power. Implementing as `energy_decay_rate_kts_per_s` in
+features.js will tighten IX.B further by distinguishing
+power-on shallow descents (e.g. routine approach to KEIK from the
+NW) from genuine power-off glides. Spec noted in the IX.B JSON
+entry's `notes` field.
+
+The standards JSON now has `phaseml_signals: ["emergency_approach_landing"]`
+on IX.B so this fires through the normal identifier path.
+
+The TRUE distinction between an INTENTIONAL simulation and a REAL
+emergency cannot be made from track shape alone. Operator can
+correlate with radio calls / metar / no-landing-occurred to confirm.
+
+---
+
+## How to use
+
+The library lives at `web/acsML/`. Three ways to consume it.
+
+### From a Node module (no HTTP)
+
+```js
+import { identifyOneTrack } from './acsML/index.js'
+
+const points = [
+  { lat: 40.04, lon: -105.23, altMslFt: 8000, tsUnix: 1779200000 },
+  // ...
+]
+const result = identifyOneTrack(points, {
+  typeCode: 'C172', tail: 'N1094F',
+})
+// result.tasks_demonstrated  → [{ code, name, instances, evidence[] }]
+// result.currency_events     → [{ rule, kind, ts, airport, night, ... }]
+// result.scores              → [{ code, score, verdict, breakdown[] }]
+// result.phase_summary       → { n_takeoffs, n_landings, n_full_stop,
+//                                n_night_landings, n_night_full_stop,
+//                                phase_seconds, ... }
+// result.notes               → freeform warnings
+```
+
+### From HTTP (the new endpoints)
+
+```sh
+# Liveness
+curl https://web-app-production-fedf.up.railway.app/api/acs-ml/health
+
+# Get the full Private Pilot ACS + 14 CFR §61.57 spec JSON
+curl https://web-app-production-fedf.up.railway.app/api/acs-ml/standards
+
+# Classify one flight (canonical {lat, lon, altMslFt, tsUnix} points)
+curl -X POST \
+  -H 'Content-Type: application/json' \
+  -d '{"points":[...],"typeCode":"C172","tail":"N1094F"}' \
+  https://web-app-production-fedf.up.railway.app/api/acs-ml/identify
+
+# Classify one flight from the on-disk yearly archive (4-tuples + t0)
+curl -X POST \
+  -H 'Content-Type: application/json' \
+  -d '{"points":[[40.04,-105.23,8000,12345],...],"t0Seconds":1767225600,"typeCode":"C172"}' \
+  https://web-app-production-fedf.up.railway.app/api/acs-ml/identify-archive
+```
+
+### From the existing `/api/flights/current` (planned)
+
+The follow-on work is to extend `resolvePurposeWithShape` →
+`resolveFlightTags` so every `/api/flights/current` row carries:
+
+```json
+{
+  "tail": "...", "type": "...", "purpose": "pattern_solo", "purpose_source": "shape",
+  "acs": {
+    "tasks_demonstrated": [{ "code": "V.A", "name": "Steep Turns", "instances": 1 }, ...],
+    "scores": [{ "code": "V.A", "score": 50, "verdict": "outside_standard" }, ...],
+    "phase_summary": { "n_landings": 26, "n_full_stop": 0, "n_night_full_stop": 0 },
+    "currency_events_today": 28
+  }
+}
+```
+
+Not landed yet — that's the next deliverable below.
+
+---
+
+## Sortie schema (single flight, complete)
+
+```json
+{
+  "tail": "N1094F",
+  "typeCode": "C172",
+  "tasks_demonstrated": [
+    { "code": "III.B", "name": "Traffic Patterns", "instances": 1,
+      "evidence": [{ "type": "phase:pattern", "duration_s": 2956, "confidence": 0.9 }] },
+    { "code": "IV.A", "name": "Normal Takeoff and Climb", "instances": 2, "evidence": [...] },
+    { "code": "IV.F", "name": "Short-Field Approach and Landing", "instances": 7,
+      "evidence": [{ "type": "short_field_landing", "ts": 1779228765,
+                     "duration_s": 60, "confidence": 0.65,
+                     "explanation": "665 fpm sustained descent into touchdown — suspected short-field technique" }] },
+    { "code": "IV.K", "name": "Go-Around/Rejected Landing", "instances": 26, "evidence": [...] },
+    { "code": "V.A", "name": "Steep Turns", "instances": 1,
+      "evidence": [{ "type": "steep_turn", "ts": 1779228175, "duration_s": 39,
+                     "confidence": 0.86,
+                     "explanation": "sustained left turn, ~704° in 39s, alt range 200 ft" }] },
+    { "code": "V.C", "name": "Ground Reference Maneuvers — S-Turns Across a Road", "instances": 3, "evidence": [...] },
+    { "code": "VII.A", "name": "Maneuvering During Slow Flight", "instances": 2, "evidence": [...] },
+    { "code": "VII.B", "name": "Power-Off Stalls", "instances": 1, "evidence": [...] }
+  ],
+  "scores": [
+    { "code": "V.A", "name": "Steep Turns", "ts": 1779228175, "durationS": 39,
+      "score": 50, "verdict": "outside_standard",
+      "breakdown": [
+        { "dimension": "bank", "target": "45°", "observed": "62°", "met": false, "weight": 2 },
+        { "dimension": "altitude_deviation", "target": "±100 ft", "observed": "±75 ft", "met": true, "weight": 2 },
+        { "dimension": "airspeed_deviation", "target": "±10 kts", "observed": "±10 kts", "met": true, "weight": 1 },
+        { "dimension": "turn_amount", "target": "360°", "observed": "281°", "met": false, "weight": 1 }
+      ],
+      "reasons": ["bank: 62° vs 45°", "turn_amount: 281° vs 360°"]
+    },
+    { "code": "V.C", "name": "S-Turns Across a Road", "score": 67, ... }
+  ],
+  "currency_events": [
+    { "rule": "61.57(a)", "kind": "takeoff", "ts": 1779225021,
+      "airport": "KLMO", "lat": 40.165, "lon": -105.16, "night": false },
+    { "rule": "61.57(a)", "kind": "landing", "ts": 1779226165,
+      "airport": "KLMO", "lat": 40.165, "lon": -105.16, "night": false,
+      "full_stop": false, "landing_type": "touch_and_go" }
+  ],
+  "phase_summary": {
+    "total_active_s": 7158,
+    "phase_seconds": { "pattern": 2956, "practice_area": 1715, ... },
+    "n_takeoffs": 2,
+    "n_landings": 26,
+    "n_touch_and_go": 26,
+    "n_full_stop": 0,
+    "n_night_takeoffs": 0,
+    "n_night_landings": 0,
+    "n_night_full_stop": 0,
+    "n_night_touch_and_go": 0
+  },
+  "notes": []
+}
+```
