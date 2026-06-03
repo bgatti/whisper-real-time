@@ -486,6 +486,77 @@ the full sub-event story while keeping the per-sortie row clean.
 
 ---
 
+## 2026-06-01 22:00 — round 9: landing-event dedup
+
+Operator: "I am a bit concerned that go-around is detecting more
+than once per circuit, maybe we can look into dedup?"
+
+Confirmed by inspecting N1094F F6 (130-min training sortie at
+KLMO): 26 IV.K instances, but 5 of them were within 60 s of the
+previous instance at the same airport. Real C172 pattern circuits
+take ≥ 60 s (KLMO is the fastest at ~60-80 s with low TPA + short
+legs); same-touchdown clusters under that are re-detections.
+
+Root cause — phaseML has TWO detectors for the same event:
+
+  - LITERAL — fires when an AGL-crossing samples shows touchdown
+    (descent → low AGL → climb out)
+  - IMPLIED — fires when an ADS-B coverage gap is bounded by a
+    descent into an airport and a climb out (the dropout-tolerant
+    fallback we leaned on in round-1)
+
+When an aircraft's actual touchdown is captured by SOME fixes
+PLUS surrounded by a coverage dropout, both detectors fire for the
+same event. The IMPLIED detector can also re-trigger on the same
+gap if there are multiple boundary candidates.
+
+### Fix
+
+In identifier.js, after extractAcsSignals returns, dedup
+chronologically:
+
+```
+For each (type ∈ {touch_and_go, landed_full_stop}, airport):
+  walk events in time order
+  drop any event within 60 s of the previously KEPT event
+  literal beats implied on same-ts ties (sort key: evidence.implied)
+```
+
+Result on the same N1094F F6 flight:
+  IV.K Go-Around: 26 → **22** (4 dropped, all within 60 s of prior)
+  n_touch_and_go: 26 → 22
+  currency_events: 28 → 24
+  notes[]: `"landing dedup: suppressed 4 touch_and_go/landed_full_stop
+            event(s) within 60s of an earlier same-airport event"`
+
+Pattern cadence sanity-check: 119-min active flight / 22 T&Gs =
+~5.4 min per circuit, which is plausible for a training sortie
+that alternates pattern work with maneuvers in the practice area
+(steep turns, S-turns, slow flight, stalls — all of which N1094F
+F6 also demonstrated).
+
+### Edge cases handled
+
+- **60 s window** chosen specifically because real C172 pattern
+  circuits at KLMO (low TPA, short legs) can be as tight as 60-80 s.
+  90 s window would clip those. 60 s catches the re-detection
+  cluster (typically 30-50 s apart) without touching real circuits.
+- **Same-airport gate** prevents legitimately-close T&Gs at
+  different fields from being suppressed (e.g. a pilot doing
+  rapid-fire between KLMO and KBDU 4 nm apart — unlikely but
+  geometrically possible).
+- **Literal beats implied** when both fire at the same instant.
+  The literal carries airport identity in `evidence.airport`
+  directly; the implied path uses `nearestAirport` of the
+  detection's startIdx sample.
+
+### Notes surface diagnostic
+
+The `notes[]` array on every `sortie_acs` now reports when
+dedup kicked in. Consumers can ignore or surface the count.
+
+---
+
 ## 2026-06-01 21:40 — round 8: climb metrics (initial climb + tow / practice cycles)
 
 Operator: "for tow flights, we want to enrich with avg rate of
