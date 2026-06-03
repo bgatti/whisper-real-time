@@ -485,6 +485,60 @@ the full sub-event story while keeping the per-sortie row clean.
 
 ---
 
+## 2026-06-01 21:15 — round 7: implied-takeoff gate tightened
+
+Operator: "I see takeoff implied outside of an airport — might just
+be a lapse in data. The medvac helicopter can do that, but
+seriously taking off is pretty well regulated."
+
+Right. The old rule was "no on_ground samples + first fix within
+5 nm of an airport → implied takeoff." That fired on transit
+overflights that happened to skim near an airport at altitude.
+
+Tightened to require actual takeoff evidence:
+
+  **Fixed-wing** (`/^(B7|A2|A3|CRJ|E7|C172|...)/` etc.) needs ALL of:
+    - first fix < **3 nm** from a known airport (was 5)
+    - first fix < **1500 ft AGL** above the nearby field's elevation
+    - mean VS over the first ~60 s > **+200 fpm** (aircraft was
+      ACTUALLY CLIMBING — a transit at level cruise wouldn't pass)
+
+  **Helicopter exemption** (per operator: medevac, fire, police,
+  EMS) — heli types can legitimately depart from off-airport sites:
+    - airport gate dropped (heli takes off from hospital pad,
+      accident scene, fire staging area)
+    - mean early VS > **+300 fpm** (steeper climb because helis
+      don't roll out — pure vertical/transitional)
+    - first fix altMslFt < 8000 (low surrogate when terrain
+      unknown; KBDU field is 5288 so 8000 covers ~2700 AGL
+      Front-Range departures)
+
+  **Neither gate fires** → NO implied takeoff. The track starts
+  airborne (transit / overflight) and we leave it that way. A
+  missing IV.A is more honest than a spurious one.
+
+### Audit trail now plain
+
+Every IV.A instance's `evidence.explanation` now says exactly where
++ how much:
+
+  - real:  `"takeoff (on_ground → airborne transition)"`
+  - fixed-wing implied: `"implied takeoff from KBJC (0.03 nm, -173 ft AGL, +442 fpm mean climb)"`
+  - heli implied:       `"implied helicopter takeoff off-airport (mean early VS +650 fpm)"`
+
+`evidence` also exposes the structured fields:
+`{ implied, source: "observed"|"fixed_wing_low_climb"|"helicopter_off_airport",
+   airport, distNm, aglFt, meanEarlyVsFpm }`
+
+### Measured impact (full 2026-04-19 day, 2800 flights)
+
+  IV.A Normal Takeoff: 1580 → 1492  (**88 fewer false-positives** —
+  spurious overflight-near-airport implied takeoffs eliminated)
+
+Other tasks unchanged.
+
+---
+
 ## 2026-06-01 20:50 — round 6: data-quality contract for phaseML
 
 Operator: "can we ensure that phaseML is consuming high quality
