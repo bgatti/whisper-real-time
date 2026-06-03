@@ -486,6 +486,67 @@ the full sub-event story while keeping the per-sortie row clean.
 
 ---
 
+## 2026-06-03 — round 11: smell test confirms detector over-firing on non-trainers
+
+Operator follow-up: "easy smell test: ACS should appear in
+training aircraft. if they detect on tow and gliders often,
+probably an issue (ideally we won't cheat and tell the ML what
+kind of plane it is — until we get good results)."
+
+Built [acsML/experiments/smell_test_by_airframe.mjs](web/acsML/experiments/smell_test_by_airframe.mjs) —
+bypasses the TASK_EXCLUSIONS gate and measures raw shape-detector
+fire rates per (airframe role × ACS task). Result on
+2026-04-19 (2800 flights):
+
+```
+task              trainer  glider tow_pla helicop turbopr  bizjet airline
+IV.B                64.0    13.3    27.3    73.5    48.3    56.6    16.4
+IV.K               236.0    33.3   245.5   110.2    60.3     8.8     0.5
+V.A                  7.0    40.0     0.0     2.0     0.0     0.0     0.0
+V.B                  5.9     0.0     0.0     0.0     0.0     0.0     0.0
+V.C                  2.2     6.7     0.0    22.4     1.7     0.0     0.1
+V.D                  0.2     6.7     0.0     0.0     0.0     0.0     0.0
+VII.A                7.7    26.7    63.6    81.6     3.4     0.9     0.0
+VII.B_or_C           4.7    40.0     9.1    14.3     0.0     0.9     0.0
+IX.A                 0.7     0.0    63.6     0.0    41.4    23.0    28.1
+IX.B                 7.7     0.0     0.0     0.0     1.7     0.0     0.0
+```
+
+(numbers are detections per 100 flights of that role)
+
+Healthy detectors — trainer fires most:
+- IV.B Normal Landing (64, helicopter 73 also legitimate)
+- V.B Rectangular Course (5.9, clean)
+- IX.B Emergency Approach (7.7, mostly trainer)
+
+UNHEALTHY — detector fires more on non-trainers than trainers:
+- **V.A Steep Turns**: glider **40** vs trainer 7 — shape catches thermalling continuous-banked-turn
+- **V.D Turns Around Point**: glider **6.7** vs trainer 0.2 — thermalling spirals
+- **V.C S-Turns**: helicopter **22** vs trainer 2 — heli alternating headings
+- **VII.A Slow Flight**: helicopter **82**, tow_plane **64** vs trainer 8 — perpetual-slow-cruise
+- **VII.B/C Stalls**: glider **40** vs trainer 5 — gradual VS changes mimic recoveries
+- **IX.A Emergency Descent**: tow_plane **64**, turboprop 41, airliner 28 vs trainer **0.7** — tow post-release dive + jets descending into KDEN
+
+The current TASK_EXCLUSIONS gate (round-10) is a pragmatic
+band-aid — each row could in principle be replaced by tightening
+the underlying shape detector. Per-detector ideas for future
+work:
+
+| Task | Shape-only tightening |
+|---|---|
+| V.A | require post-maneuver level flight (no continued banking — would reject thermalling) |
+| V.D | tighten alt-range (gliders climb in thermals; real V.D is ±100 ft) |
+| V.C | require crossings ~90° to reference + altitude held strictly |
+| VII.A | require RECOVERY to cruise within N minutes after slow segment (rejects perpetually-slow) |
+| VII.B/C | require sharper VS change (real stall break is seconds, not gradual descent) |
+| IX.A | require START from cruise altitude (> 4000 AGL) AND recovery to level after (rejects tow post-release dive and continued-to-landing airliner descent) |
+
+Each tightening would need to be verified on the smell-test
+matrix WITHOUT regressing the trainer rate.
+
+Until then, TASK_EXCLUSIONS stays in. It documents the known
+detector limitations in code where they're auditable.
+
 ## 2026-06-03 — round 10: task-applicability gates (per curated-case review)
 
 Operator shared a curated list of "one representative per task"
@@ -578,6 +639,37 @@ doesn't show up anymore.
   encoded yet. Helicopter exclusions are a follow-on.
 
 ---
+
+## 2026-06-03 — round 9b: dedup window 60s → 120s
+
+Operator: "did we dedup yet — i still see more go arounds than
+altitude cycles."
+
+Looked at N1094F F6 gap sequence. Found events at 60, 70, 74, 77,
+98 second intervals — all clearly the same touchdown re-detected
+(different AGL values for the "same" landing, 100-200 ft sample
+jitter from alt correction).
+
+The 60 s threshold was wrong. Math: standard C172 pattern is
+bounded by climbout (~90 s to TPA at 700 fpm) + crosswind +
+downwind + base + final = 3-5 min minimum at non-towered fields.
+Sub-2-min gaps are physically impossible — they're re-detections.
+
+Bumped to **120 s** window. Now N1094F F6: 22 → **17** IV.K (was
+26 raw). 119 min / 17 ≈ 7 min per circuit — still conservative
+but legitimate.
+
+For the "altitude cycles" question: `climb_cycles[]` uses a
+1500 ft alt gain gate (catches practice-area climbs to 2000+
+AGL). Standard pattern T&Gs climb only to TPA (~1000 AGL) so
+they DON'T appear in `climb_cycles[]`. The two counts measuring
+different things, by design:
+- `IV.K` = each touchdown-then-climb-out event
+- `climb_cycles[]` = each high-altitude (1500+ ft) climb-release-descent
+
+For N1094F F2 (mixed pattern + practice maneuvers in the practice
+area): IV.K=11 + climb_cycles=6 — the 6 cycles are the practice-
+area climbs; the 11 IV.K are the pattern T&Gs.
 
 ## 2026-06-01 22:00 — round 9: landing-event dedup
 
