@@ -20,6 +20,7 @@ enough captured points (≥ 30 fixes, ≥ 5 min active wall-clock).
 | IX.B Emergency Approach (simulated) detector | ✅ v0.3 live | `acsML/features.js` `detectEmergencyApproach` — descent < 800 AGL away from airport with climb-out recovery |
 | ACS performance-standard scoring | ✅ v0.2 live | `acsML/scoring.js` (V.A, V.B, V.C, V.D) — `result.scores[]` on each flight |
 | Energy-based glide / power detection | ⚠ v0.3 spec only | `E = ½v² + g·h` decay rate; specced in IX.B notes, not yet implemented |
+| Throttle estimate per detection (mean + pre-event) | ✅ v0.4 live | `acsML/features.js` uses main API's `estimateThrottle` + `perfForType` — attaches `evidence.meanThrottle` and `evidence.preEventThrottle` to every detection. Drives IX.A `spiraling_and_idle`, IX.B `throttle_idle`, VII.B `pre_throttle_low`, VII.C `pre_throttle_high` selectors |
 | FAR 61.57(a) day currency | ✅ v0 live | `acsML/identifier.js` emits per-takeoff / per-landing events |
 | FAR 61.57(b) night currency | ✅ v0 live | uses NOAA sunrise/sunset (`acsML/suntimes.js`) at airport lat/lon |
 | Sortie counts (landings, full_stop, night) | ✅ v0.2 live | `result.phase_summary` has n_takeoffs / n_landings / n_full_stop / n_touch_and_go / n_night_takeoffs / n_night_landings / n_night_full_stop / n_night_touch_and_go |
@@ -340,6 +341,94 @@ on IX.B so this fires through the normal identifier path.
 The TRUE distinction between an INTENTIONAL simulation and a REAL
 emergency cannot be made from track shape alone. Operator can
 correlate with radio calls / metar / no-landing-occurred to confirm.
+
+---
+
+## 2026-06-01 19:30 — operator feedback round 4: throttle as a first-class citizen
+
+Feedback:
+> main API has added throttle as first class citizen of a flight path
+> probably this is helpful for emergency descent etc?
+
+YES — huge. The main API's
+[throttleEstimate.js](web/throttleEstimate.js) model produces a
+per-fix 0..1 throttle estimate (climb_fraction + level_flight_fraction
+against the type's POH-derived
+[aircraftPerf.js](web/aircraftPerf.js) table). Wired it into acsML:
+
+### What changed
+
+[features.js](web/acsML/features.js):
+- `estimateThrottleSeries(samples, typeCode)` produces a parallel
+  throttle series. Engineless types return all-null.
+- `extractAcsSignals` now attaches `evidence.meanThrottle` and
+  `evidence.preEventThrottle` (5 s pre-event window) to EVERY
+  detection. Selectors and gates then read those fields.
+
+[identifier.js](web/acsML/identifier.js):
+- New selectors:
+  - `spiraling_and_idle` — IX.A Emergency Descent (was just
+    `spiraling`). Requires both the turn AND idle throttle.
+  - `throttle_idle` — IX.B Emergency Approach. Mean throttle <
+    0.4 across the descent.
+  - `pre_throttle_low` / `pre_throttle_high` — VII.B Power-Off
+    vs VII.C Power-On stall selectors. Was inferring from
+    post-break VS; now reads the actual pre-break power.
+
+### Measured impact (full 2026-04-19 day, 2800 flights)
+
+| Code | Before throttle | After throttle | Why |
+|---|---|---|---|
+| IX.A Emergency Descent | 82 | **6** | Required pre-existing spiraling gate kept airline arrival turns; throttle gate finally eliminates them — only idle spirals (real training maneuvers) survive |
+| IX.B Emergency Approach | 45 | 40 | Most candidates already had idle-ish throttle |
+| VII.B Power-Off Stalls | 51 | 30 | Now requires pre-event throttle < 0.3 |
+| VII.C Power-On Stalls | 0 | **9** | Previously couldn't distinguish — defaulted to Power-Off. Now the throttle > 0.7 cases get the right label |
+
+Example IX.A now: "N6719Z vs -1856 fpm avg, lost 1600 ft in 58s,
+spiraled -689°" — clearly a training emergency descent at idle.
+
+### Sortie schema (updated)
+
+Every detection's `evidence` object now carries:
+```json
+{
+  "meanThrottle":      0.18,  // mean over [startIdx, endIdx]
+  "preEventThrottle":  0.85   // mean over 5 s before startIdx
+}
+```
+
+(plus all the existing fields from phaseML's detectors). Engineless
+aircraft return `null` for both.
+
+### Where the estimate falls short — honest limitations
+
+The throttle estimate is a MODEL not a measurement (the FAA doesn't
+broadcast manifold pressure):
+
+- **No wind**: GS is used as a TAS proxy. A 25-kt headwind makes a
+  cruise-throttle aircraft look like it's at 50% throttle.
+- **No turbo / boosted compensation** at altitude beyond a flat-line
+  proxy in the existing code.
+- **High-speed descents on idle**: a pilot trading altitude for
+  speed at idle produces a high `level_frac` because the model
+  thinks "power required at that speed is high" — could over-read
+  throttle. Counterbalanced by the strong negative `climb_frac` but
+  the cap at 0 means net throttle reads high.
+- **Engineless types**: throttle is null. Selectors default to
+  passing-through ("we don't know power") so glider tracks still
+  classify normally.
+
+The estimate is good enough for the binary gates above (idle vs
+cruise vs full). For fine-grained scoring (e.g., "how stable was
+the pilot's power setting in slow flight?"), we'd want
+real-instrument data we don't have.
+
+### Side benefit
+
+`evidence.preEventThrottle` is also useful for scoring V.A Steep
+Turns — ACS doesn't specify a throttle target but instructors
+expect power-on-then-back-to-cruise. We can add that to the V.A
+scorer if it's wanted; for v0 we left scoring throttle-blind.
 
 ---
 
