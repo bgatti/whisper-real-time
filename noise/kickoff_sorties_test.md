@@ -486,6 +486,69 @@ the full sub-event story while keeping the per-sortie row clean.
 
 ---
 
+## 2026-06-03 — round 14c: "towing are pawnee and supercub" — drop shape rule, narrow type override
+
+Operator follow-up after round-14b deploy: leaderboard rollup still
+showed RV8 → "Glider tow ~ shape (92%) (2 types) … RV8 RV8". Two
+things going on still:
+
+1. **Production never picked up round-14/14b** — the 92% conf and the
+   "shape" source predate the round-14 deploy. The leaderboard reads
+   stored `tracks.purpose` / `purpose_source` / `purpose_confidence`
+   that were written at ingestion time by the OLD classifier.
+
+2. **Operator gave a definitive scope: "towing are pawnee and
+   supercub."** That ends the discussion about shape-based tow
+   detection — there is no legitimate use case for it at our fields.
+   Anonymized tow planes are PA25 or PA18 with type code present;
+   anything else is not a tow plane.
+
+### Fix
+
+Three coordinated changes in `web/` (commit `70d5bdb` on
+`feature/sortie-globalized`):
+
+| File | Change |
+|---|---|
+| [purposeML/classifier.js](web/purposeML/classifier.js) | `/^(PA25\|PA18\|PIAT\|PC6)$/` → `/^(PA25\|PA18)$/`. Removed the shape-based `tow_plane` rule entirely. |
+| [vite.config.js](web/vite.config.js) `resolvePurposeWithShape` | Same regex narrowing. |
+| [sortiesPlugin.js](web/sortiesPlugin.js) `TOW_PLANE_TYPE_RE` | Same regex narrowing — kept in lockstep so sortie merge thresholds + acsML taxonomy filter still resolve `sortieIsTowPlane` consistently. |
+
+### Why removing the shape rule is safe
+
+Rounds 14 + 14b each tightened the shape rule (added cruise-speed
+cap, raised landings threshold, raised altP50 floor). After every
+tighten, a 14-day production-scale scan found ZERO real anonymized
+tow planes caught — every shape-rule hit was a false positive
+(C172 emergency-descent training at KBDU read as "tow signature").
+Removing the rule is a no-op on real data and forecloses future
+drift if the underlying features ever shift.
+
+### Verified on 14-day window (6596 sorties)
+
+| | Round-14b | Round-14c |
+|---|---|---|
+| `tow_plane` total | 133 | **126** |
+| via type override PA25 | 113 | 113 |
+| via type override PA18 | 13 | 13 |
+| via type override PIAT (N12JA) | 7 | **0** |
+| via shape rule | 0 | **0 (rule removed)** |
+| non-PA25/PA18 leaks | 0 | **0** |
+
+PIAT (N12JA Pilatus Porter) was previously caught by the override at
+KBDU; the operator's "pawnee and supercub" directive deliberately
+excludes it.
+
+### Production deploy still gapped
+
+Operator's :29 PM N969F sighting at 92% is what's stored in the
+production DB now — it'll persist until a re-ingestion or a deploy
+that recomputes purpose for cached tracks. The web/ subrepo deploy
+will close the live-rollup gap; the stored-purpose backfill is a
+separate concern for the data-quality channel.
+
+---
+
 ## 2026-06-03 — round 14b: tow_plane shape rule still leaking — make it uniquely tow
 
 Operator follow-up after round-14 deploy: spotted N969F (RV8) at
