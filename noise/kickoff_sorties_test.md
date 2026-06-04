@@ -486,6 +486,74 @@ the full sub-event story while keeping the per-sortie row clean.
 
 ---
 
+## 2026-06-04 — round 14d: PA25 sorties tagged "local" because purposeML never ran
+
+Operator: "we are seeing tow planes purposes as local and etc. really
+need to categorize tow planes correctly. curl sorties and ensure."
+
+### Diagnosis from `/api/sorties?airport=KBDU&day=2026-06-03`
+
+Of 23 PA25 (Pawnee) sorties on 2026-06-03 KBDU, only **5** were
+tagged `tow_plane`. The other **18** were tagged `local` with
+`sortie_purpose_source=geometry` and reasons=`None` — the geometry
+classifier doesn't have a `tow_plane` purpose.
+
+| | Count |
+|---|---|
+| PA25 → tow_plane (via purposeML type override, src=shape) | 5 |
+| PA25 → local (via geometry classifier, purposeML skipped) | 18 |
+
+### Root cause
+
+[sortiesPlugin.js:2235](web/sortiesPlugin.js#L2235) gated purposeML
+on `purposeRealPts.length >= 30`. ADS-B coverage at low altitude
+on tow climbs at KBDU is spotty (Schweizer 1-26 / tow plane climbing
+at 65-75 kts to 2000 AGL with terrain shadowing). A typical 10-min
+tow sortie ends up with most points repaired and < 30 real fixes.
+purposeML was never called, so the type override
+(PA25/PA18 → tow_plane @ 0.95) never fired.
+
+### Fix
+
+Added a type-code short-circuit BEFORE the real-points gate. Uses
+the existing `sortieIsTowPlane` boolean (derived from
+`TOW_PLANE_TYPE_RE = /^(PA25|PA18)$/`, in lockstep with round-14c's
+narrowing):
+
+```js
+if (sortieIsTowPlane) {
+  sortiePurpose = 'tow_plane'
+  sortiePurposeSource = 'type'
+  sortiePurposeConfidence = 0.95
+  sortiePurposeReasons = [`type=${sortieTrack.type} (tow plane airframe)`]
+}
+if (!sortiePurpose && purposeMLClassifyFn) { /* existing shape path */ }
+```
+
+The type override is deterministic — no shape inference needed, no
+minimum point count needed.
+
+### Verified on 2026-06-03 KBDU (64 sorties)
+
+| | Before | After |
+|---|---|---|
+| PA25 → tow_plane | 5 | **23** |
+| PA25 → local | 18 | **0** |
+| Other types' purposes | unchanged | unchanged |
+
+Commit `559a1fd` on `feature/sortie-globalized` (web/ subrepo).
+
+### Followups noted but not addressed today
+- N12JA (PIAT) sortie tagged `practice_area` via geometry — fine,
+  operator's directive is that PIAT isn't tow at KBDU.
+- AS50 (Eurocopter AS350 helicopter) tagged `glider_local` /
+  `practice_area` / `survey` — separate bug, the engineless-type
+  detection regex `/^AS\d/` catches both Schleicher gliders (AS21/AS26)
+  and Aerospatiale helicopters (AS50). Earlier rounds tightened to
+  `/^AS[1-3]\d/`; needs verification in features.js + vite.config.js.
+
+---
+
 ## 2026-06-03 — round 14c: "towing are pawnee and supercub" — drop shape rule, narrow type override
 
 Operator follow-up after round-14b deploy: leaderboard rollup still
