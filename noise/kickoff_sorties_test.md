@@ -486,6 +486,70 @@ the full sub-event story while keeping the per-sortie row clean.
 
 ---
 
+## 2026-06-03 — round 14b: tow_plane shape rule still leaking — make it uniquely tow
+
+Operator follow-up after round-14 deploy: spotted N969F (RV8) at
+:29 PM tagged `Glider tow ~ shape (92%) (inferred from pattern)`.
+"this is not a tow plane and the tow pattern is very unique."
+
+### Diagnosis
+
+Two things going on:
+
+1. **Production is behind.** The 92% confidence on the wire matches
+   the OLD shape rule (`confidence: 0.92`). Round-14 lowered it to
+   0.85. Local dev with round-14 applied returned 0 shape-rule tow
+   tags across the 14-day KBDU window. Production needs a deploy.
+
+2. **The round-14 rule was still leaky.** Even on local, scanning a
+   14-day window surfaced 2 N52993 C172 sorties slipping through at
+   0.85 conf. Example: `alt_p90=3034 AGL, max_descent=-2250 fpm,
+   cruise=97 kts, 2 cycles` — looks tow-ish but is C172 emergency-
+   descent practice, not a tow op.
+
+### Fix: make the rule UNIQUE to tow ops
+
+Real tow has a signature no other GA flight matches. Four hard
+gates, each leaky alone but ALL-true only on real tow:
+
+| Gate | Value | Excludes |
+|---|---|---|
+| `cruiseSpeedKts` | `> 50 && < 95` | RV8 (165), Bonanza/Cirrus (150-180), C172 (110-115), gliders |
+| `totalLandings` | `>= 5` | Random pattern T&Gs (3-4 cycles) |
+| `altAglP50` | `> 1500` | Pure-pattern flights (TPA is 1000) |
+| `altAglP90` | `1800..4500` | Cruise / XC flights |
+| `maxClimbFpm` | `400..1500` | Solo-light max climb (fast climber) |
+| `maxDescentFpm` | `< -1500` | Normal descent (post-release dive only) |
+| `homeTraits.gliderPort` | `true` | Non-glider fields |
+
+PA25 cruise is 95-110 kts but a real tow op's median GS sits at 70-90
+(slow climb + faster descent blended). Capping at 95 kts is safe for
+real tow even at the shape-rule level — and PA25/PIAT are already
+caught at 0.95 by the type override at the top of `classifyTrack`,
+so the shape rule is purely the safety net for anonymized tow planes.
+
+Confidence dropped 0.85 → 0.80 to reflect that this rule fires
+without a type-code witness.
+
+### Verified on 14-day window (~691 KBDU sorties)
+
+| | Before (round-14) | After (round-14b) |
+|---|---|---|
+| `tow_plane` total | 135 | 133 |
+| via type override (conf 0.95) | 133 | 133 |
+| via shape rule (conf 0.85/0.80) | 2 (both N52993 C172 false-pos) | **0** |
+
+Commit `5a2e3f6` on `feature/sortie-globalized` (web/ subrepo).
+
+### Production deploy gap
+
+Operator's 92% sighting predates round-14. Need to deploy the web/
+subrepo for production to pick up both round-14 (type override +
+initial shape tighten) and round-14b (cruise speed cap + landings ≥
+5 + altP50 > 1500).
+
+---
+
 ## 2026-06-03 — round 14: tow_plane shape rule was tagging every C172 at a glider port
 
 Operator spotted six KBDU sorties tagged `tow_plane` at 0.92 conf
