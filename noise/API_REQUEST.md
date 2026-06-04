@@ -440,7 +440,107 @@ So users now see the truth instead of a silent empty radius. The
 `sortie_source` annotation is fine as a permanent secondary signal
 even after the 503 work lands.
 
-**Status: [PENDING-SERVER — P0 incident, user-blocking, filed 19:04Z].**
+**Status: [PARTIAL — §2h-3 ✅ landed @ ~19:14Z, others still pending].**
+
+##### Server response 2026-06-04T19:14Z — `503 + Retry-After` landed ✅
+
+The server now returns proper HTTP 503 for the timeout path with the
+exact shape § 2h-3 asked for:
+
+```
+HTTP/1.1 503 Service Unavailable
+Content-Type: application/json
+Cache-Control: public, max-age=15           ← § 2h-2 still NOT fixed
+Retry-After: 5
+Content-Length: 181
+
+{
+  "error": "sortie data source temporarily unavailable",
+  "error_kind": "db_timeout",
+  "stage": "live",
+  "detail": "load_timeout",
+  "retry_after_seconds": 5,
+  "sortie_source": "db_timeout:live 12h"
+}
+```
+
+The structured fields (`error_kind` / `stage` / `detail`) are
+better than § 2h-4 asked for — they distinguish the failure mode
+without bespoke string-matching. Nice.
+
+##### Still pending after the 19:14Z deploy
+
+- **🚨 § 2h-1: live cache itself is still broken.** Every window
+  still times out → 503. The 503 is correct framing but the user
+  still can't load any data. This is the actual P0 — investigate
+  the pg-pool / index / warmup suspects.
+- **🚨 § 2h-2: `Cache-Control: public, max-age=15` is still on the
+  failure response.** The status went 200 → 503 but the
+  cache-the-failure bug travelled with it. Browsers will treat the
+  503 as cacheable for 15 s (the freshness rule applies to 5xx
+  responses too if explicit Cache-Control says so), defeating the
+  Retry-After hint. Quick fix: emit `Cache-Control: no-store` when
+  `error_kind === "db_timeout"`.
+- **§ 2h-4 (sortie_health top-level):** superseded by the
+  `error_kind`/`stage` structure on the 503 body — that's strictly
+  better. Closed.
+
+##### Update 19:21Z — server team commits visible
+
+Inner-repo `noise/web` log shows two server-team deploys:
+
+```
+39ad2fe (19:12Z) sorties: 503 + Retry-After on db_timeout; add (day, id) index
+9e12c0f (19:21Z) sorties: 30s response cache to bound recompute cost per request
+```
+
+The (day, id) index attempt didn't fix the DB query — at 19:26Z
+every window 1h–48h still returns 503 within an 8 s timeout
+budget (doubled from the 4 s I observed at 19:14Z). The 30 s
+response cache adds an `X-Sortie-Cache: MISS|HIT` header but
+currently misses on every request since nothing is successful
+enough to populate it.
+
+**Cache-Control: public, max-age=15 is STILL on the 503 response
+after both deploys.** That keeps the cache-the-failure bug live —
+the response cache header is independent of the response code, so
+the 503 itself is being treated as freshness-valid for 15 s by
+upstream proxies / browsers. This is the simplest of the four
+asks and the only one not yet touched.
+
+##### Suggested next moves for the server team
+
+If the DB query is still failing even with the new index, the
+likely remaining suspects (in rough order):
+
+1. **Check `pg_stat_activity` for long-running / blocked queries.**
+   If something is holding a lock on the sortie path table, the
+   index won't help.
+2. **Check pg-pool stats** — if pool is exhausted (waiting > max
+   wait), new requests time out without ever reaching PG.
+3. **Validate the new (day, id) index is actually being used by
+   the query planner** — `EXPLAIN ANALYZE` on the production
+   sortie query. An index that exists but isn't picked still leaves
+   you on the sequential scan.
+4. **If queries are slow even with the index, the query itself may
+   need rewriting** — windowed aggregations against the sortie path
+   are sometimes faster done in two passes (id range first, then
+   per-id aggregation) than one combined query.
+
+##### One simple fix the server team should still ship — §2h-2
+
+```diff
+- res.setHeader('Cache-Control', 'public, max-age=15')
++ if (res.statusCode >= 500 || sortie_count === 0) {
++   res.setHeader('Cache-Control', 'no-store')
++ } else {
++   res.setHeader('Cache-Control', 'public, max-age=15')
++ }
+```
+
+Without this every browser + intermediate proxy caches the 503
+for 15 s, defeating the Retry-After hint and amplifying the
+outage window for every consumer.
 
 ---
 
