@@ -343,8 +343,15 @@ window.
 ##### Reproduce (copy/paste, no auth required)
 
 ```bash
-# Run any of these against http://localhost:5183 (dev proxy) or
-# https://noise-production.up.railway.app (prod). Same response.
+# Architecture note: the noise API is served by noise/web/start.js
+# under the local Vite dev proxy at 127.0.0.1:5183. It forwards
+# query execution to Railway PostgreSQL via the pool in
+# noise/web/db.js. The 404 on /api/sorties at the public
+# regionalcompliance-production.up.railway.app confirms the noise
+# API is only exposed via the local Node process — so the timeout
+# is on the [Node → Railway PG] path, not on a remote API surface.
+# Suspect either the pg-pool config or the PG instance itself.
+
 curl -sI -w "\nstatus=%{http_code} ttfb=%{time_starttransfer}s total=%{time_total}s\n" \
   "http://localhost:5183/api/sorties?center=39.985,-105.21&radius_nm=4&hours=1"
 
