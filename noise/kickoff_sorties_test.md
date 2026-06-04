@@ -486,6 +486,94 @@ the full sub-event story while keeping the per-sortie row clean.
 
 ---
 
+## 2026-06-03 — round 14: tow_plane shape rule was tagging every C172 at a glider port
+
+Operator spotted six KBDU sorties tagged `tow_plane` at 0.92 conf
+that were obviously not tow ops:
+
+| Tail | Type | Why "tow" was wrong |
+|---|---|---|
+| N52993 | C172 | Journeys Aviation flight-school pattern |
+| N3547L | C172 | School T&Gs, peak 1200-2775 AGL, climb_cycles=0 |
+| N333RX | C172 | School T&Gs |
+| N143J  | CH7A | Recreational pattern work |
+| N501EL | RV-8 | RV homebuilt, not a tow plane |
+
+Operator: "glider tow / ~ shape (92%) / we seem to have not
+identified gliders tow correctly, let's evaluate that."
+
+### Root cause
+
+The old shape rule in `purposeML/classifier.js` was:
+
+```
+totalLandings >= 3
+  && altAglP90 < 4500
+  && maxClimbFpm > 700
+  && homeTraits.gliderPort
+```
+
+KBDU is `gliderPort: true`. Every trainer doing pattern work at
+KBDU hits `totalLandings ≥ 3`, peaks below 4500 AGL, and shows
+maxClimbFpm > 700 somewhere in the track (initial climb-out). The
+rule could not distinguish a pattern T&G session from a real tow
+release.
+
+### Discriminating shape: pattern vs tow
+
+| Metric | Pattern T&G | Tow release |
+|---|---|---|
+| altAglP90 | ~1000 (TPA) | 2000-3500 (release) |
+| altAglP50 | ~600-800 (in pattern most of time) | > 1200 (cruise after release) |
+| maxClimbFpm | 700-1200 (light solo) | 400-1500 (towing under load) |
+| maxDescentFpm | ~-700 | ≤ -1500 (idle dive after release) |
+
+### Fix in [purposeML/classifier.js](web/purposeML/classifier.js)
+
+Two-part fix:
+
+**1. Tightened shape rule** (replaces the old 4-gate rule):
+
+```
+totalLandings >= 3
+  && altAglP90 > 1800            // released ABOVE TPA, not pattern peak
+  && altAglP90 < 4500
+  && altAglP50 > 1200            // median above TPA — not pure pattern
+  && maxClimbFpm > 400           // climbing under load
+  && maxClimbFpm < 1500          // not solo light-plane max climb
+  && maxDescentFpm < -1500       // characteristic post-release dive
+  && homeTraits.gliderPort
+```
+
+Confidence dropped 0.92 → 0.85 to reflect shape-only inference.
+
+**2. Type-code overrides moved into classifyTrack** (PA25/PA18/
+PIAT/PC6 → `tow_plane` @ 0.95). `resolvePurposeWithShape` in
+`vite.config.js` already does this BEFORE calling us — but
+`sortiesPlugin.js` calls `classifyTrack` directly without the
+wrapper. So the override has to live at the classifier level too,
+or real PA25s fall through to geometry `local` once the shape rule
+tightens.
+
+This is a known architectural duplication; the comment in the
+file documents it. The right long-term fix is to either (a) push
+all type overrides down into `classifyTrack` and remove the
+wrapper logic, or (b) have `sortiesPlugin` go through the
+wrapper. Not doing that today — minimal-change rule.
+
+### Verified on 2026-06-03 KBDU /api/sorties
+
+| Before | After |
+|---|---|
+| 6 false `tow_plane` (C172/CH7A/RV-8) at 0.92 | **0 false tows** |
+| 6 real PA25/PIAT `tow_plane` tagged via wrapper | 6 real PA25/PIAT still `tow_plane` (now via classifier-level type override, conf 0.95, reason `type=PA25 (tow plane airframe)`) |
+| C172/CH7A/RV-8 mis-tagged tow | now `training` / `pattern_solo` / `local` |
+
+All tests still pass (`resolvePurposeWithShape` 18/18). Commit:
+`469473e` on `feature/sortie-globalized` (web/ subrepo).
+
+---
+
 ## 2026-06-03 — round 13: boundary-conditions sortie split (N52993 case)
 
 Operator queried N52993 (Journeys Aviation C172 at KBDU) sorties
