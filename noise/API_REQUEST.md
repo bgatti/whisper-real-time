@@ -390,6 +390,109 @@ emitting `event: pass\ndata: {...}` for each new audible flight. The
 kiosk already has the WebSocket infra
 (`/api/adsb/stream`); SSE mirrors that for the report use case.
 
+### 14. Time-window UTC handling on `/api/excursions/segments`
+
+**Filed 2026-06-03; re-tested 2026-06-04.** The user dragged the
+time-window chip from 6 h → 12 h and observed "only 6 hours of
+data". First test pointed at a server bug; second test (after a
+vite restart) showed the server is fine and the symptom is
+**data sparsity + live-ingest gaps**, not parameter mishandling.
+
+#### 14.0 — Re-tested: parameter is honoured
+
+Curl matrix at the listener (lat 39.9894, lon −105.2258, current):
+
+```
+hours=1   → window.hours=1   from=2026-06-03T22:09  to=2026-06-04T04:09  tracks=8
+hours=6   → window.hours=6   from=2026-06-03T22:09  to=2026-06-04T04:09  tracks=8
+hours=12  → window.hours=12  from=2026-06-03T16:10  to=2026-06-04T04:10  tracks=8
+hours=24  → window.hours=24  from=2026-06-03T04:10  to=2026-06-04T04:10  tracks=8
+hours=48  → window.hours=48  from=2026-06-02T04:10  to=2026-06-04T04:10  tracks=8
+```
+
+`window.hours` matches the request in every case; from/to slide
+the window backward correctly. **The earlier failing test
+(2026-05-24/25 stale slice) was against a server in a state where
+the live-ingest path had been stopped for ~9 days.** Touching
+vite.config.js to restart re-engaged the ingest and unblocked the
+fresh data.
+
+#### 14.1 — Data sparsity + ingest reliability (the actual issue)
+
+The 12 h `hours=12` window returned `window.from`=10:10 AM local,
+`window.to`=10:10 PM local. The actual fixes inside that window only
+span **18:00–20:00 local**:
+
+```
+fixes total: 925
+18:00  559
+19:00  282
+20:00   84
+```
+
+So the user's "I only see 6 hours of data" is correct in the sense
+that flight activity in this radius today only spans ~3 hours of
+the requested 12. That's not a server bug — it's how many
+flights actually went overhead.
+
+What IS a server-side hardening opportunity:
+
+**Ask 1 — live-ingest health.** When the user observes data
+sparsity, they can't distinguish (a) "ingest stopped" from
+(b) "the world was quiet". Add `data_horizon.newest_ts` (timestamp,
+not just date) to the segments response so the client can render
+"data freshness" — green if newest_ts is within the last 5 minutes,
+amber 5-60 min, red > 60 min.
+
+**Ask 2 — auto-recovery from ingest stalls.** The 2026-05-25
+stale slice persisted for 9 days before a manual vite restart
+brought ingest back. Add a heartbeat that auto-restarts the ingest
+worker if it hasn't ingested a fix in N minutes. Without this the
+dev box can be in a "looks healthy but isn't" state indefinitely.
+
+**Ask 3 — `window.fix_span_hours` in the response.** Even when the
+window is correctly served, the visible-flight span is often much
+narrower (above: 3 of 12 hours). Surfacing the actual fix-time
+span in the response (`window.fix_first_ts`, `window.fix_last_ts`)
+lets the client paint the empty parts of the time axis as
+"no traffic observed" rather than misleading the user into thinking
+the chart axis hides data.
+
+#### 14.2 — UTC labelling on chart axes (client-side fix)
+
+The segments response carries timestamps as ISO 8601 UTC, which is
+correct. The client uses `new Date(closestTs).getHours()` to bin
+locally for display. That's also correct for showing "9 am" in the
+viewer's wall-clock time.
+
+What's NOT correct: the page implicitly assumes that "9 am" on the
+chart means "9 am today" (or 9 am within the current window). If
+the server ever returns a stale window (see § 14.1's auto-recovery
+ask) and the client bins by hour-of-day, the user gets visually-
+recent-looking morning patterns that are actually older. This is a
+*labelling* bug, not a timezone bug — the bins are technically
+correct but the presentation can mislead.
+
+**Ask:** none on the server. The fields the client needs to drive
+the labelling fix are already in the response (`window.from`,
+`window.to`, the per-segment `startedAt` timestamps). Client will
+fade headline KPIs and annotate the time axis with the actual date
+when `window.to` is more than 6 h before `now`. Flagging here so
+the server team knows the labelling change depends on `window.to`
+being accurate (it already is).
+
+#### Channel back to server team
+
+Edit inline when § 14 lands or needs clarification:
+
+- `[DONE]` — `data_horizon.newest_ts` lands AND ingest-watchdog is
+  running. Client closes the channel.
+- `[BLOCKED]` — `[BLOCKED] <reason>` if the ingest watchdog needs
+  infra (systemd / cron / process supervisor) outside the segments
+  handler's scope.
+- `[CLARIFY]` — `[CLARIFY] <question>` for anything in § 14 that's
+  ambiguous.
+
 ### 12. Take-Action panel — turn the report into a petition
 
 User direction 2026-06-03: residents reading the report want a
