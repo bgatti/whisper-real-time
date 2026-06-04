@@ -154,6 +154,75 @@ Until then, the page mitigates with a tighter initial query
 (`hours=1`) and a visible loading state — but the right fix is at the
 query layer.
 
+#### 2b — Limit-truncation is a correctness bug, not just performance
+
+**Filed 2026-06-03** based on a user-side comparison of
+`/api/sorties?airport=KBDU&hours=12` vs
+`/api/excursions/segments?lat=40.005&lon=-105.205&hours=12&radius_nm=3`.
+
+The sortie endpoint (airport-anchored) reported **39 sorties** at KBDU
+in the window, peaking at noon MDT (12 flights). The segments endpoint
+(listener-anchored at Frasier Meadows, 3 nm south of KBDU) reported
+
+```
+matched / candidates_considered: 20 / 500
+tracks returned: 20
+```
+
+The 500 in `candidates_considered` is exactly the `limit` query param —
+meaning the SQL pull hit the cap. The JS-side geo filter then narrowed
+500 → 20 because most of the 500 candidates were outside the 3 nm
+radius.
+
+The risk this exposes: if 500+ tracks exist in the time window AND any
+in-radius tracks sort below position 500 (by whatever order the SQL
+query uses — currently date-DESC), **they vanish from the response**.
+The page silently shows a too-small subset. We won't see the bug as a
+visible error; we'll see the chart understate flight activity, and the
+user can't tell from the page that the data is incomplete.
+
+In practice the segments-at-listener response shows zero activity
+between 10 AM and 6 PM MDT today even though the airport saw a noon
+sortie peak; some of that gap is geometric (morning training stayed
+north of the listener) but some is almost certainly limit-truncation.
+
+**Ask reinforcement:** SQL-side bounding-box filter eliminates both the
+latency AND the truncation issue. With geometry in SQL, the LIMIT
+applies AFTER the geo filter — only in-radius tracks count toward the
+500. The current ordering (limit BEFORE geo filter) means the response
+is non-deterministic above some flight-volume threshold.
+
+**Until §2 / §2b lands:** the client raises `limit` to its tolerable
+ceiling (500 today, could push to 2000 with payload-size tradeoffs)
+and surfaces `candidates_considered: <limit>` as a "possibly truncated"
+warning. Both are mitigations; the real fix is the SQL filter.
+
+**Confirmation 2026-06-03.** User: *"3Days fetches the same data /
+I think 500 paths may be crimping the search"*. Re-curled 12 h vs 72 h
+with same lat/lon/radius/limit; both return identical responses:
+
+```
+hours=12  candidates_considered=500  matched=20  tracks=20
+          fix span 2026-06-03 18:00:24 -> 22:53:06   (4.9 h)
+hours=72  candidates_considered=500  matched=20  tracks=20
+          fix span 2026-06-03 18:00:24 -> 22:53:06   (4.9 h)
+```
+
+Identical. The user's intuition is exact: the LIMIT is the constraint,
+the time window is moot. A 3-day query sees the same 500 most-recent
+tracks, filters geometrically to the same 20, and returns the same
+4.9-hour fix span. The first-day's worth of older flights — including
+the morning training peak the sortie endpoint shows clearly — are
+literally invisible to the client because they sort below the
+LIMIT-imposed horizon.
+
+The user's `12 h is only 6 h` complaint from a few hours ago wasn't
+data-sparsity (which I had earlier concluded in § 14.0); it was
+LIMIT-truncation. § 14.0 stands re: the `hours` parameter being
+honoured, but the response is silently truncated so the window
+parameter has no observable effect once the time slice is large
+enough to contain >500 candidates.
+
 ---
 
 ## P1 — make the report better
