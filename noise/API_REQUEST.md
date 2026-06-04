@@ -462,6 +462,72 @@ to compute it on the client.
 
 #### 12.2 — Migrate the page from `/api/excursions/segments` to `/api/sorties`?
 
+**Perf measured live 2026-06-03 (KBDU dev box, warm cache):**
+
+| Window | sortie endpoint | sortie KB | sortie count | segments endpoint | segments KB |
+| ------:|----------------:|----------:|-------------:|------------------:|------------:|
+| 1 h    | 1.50 s | 36 KB | 2  | 2.72 s | 80 KB |
+| 6 h    | 0.99 s | 102 KB | 9 | 2.98 s | 80 KB |
+| 24 h   | 0.75 s | 886 KB | 65 | 2.94 s | 80 KB |
+| 72 h   | 1.99 s | 1.4 MB | 96 | — | — |
+| 168 h  | 1.20 s | 1.4 MB | 96 (cached) | — | — |
+
+Sortie is **2-4× faster warm** and crucially has **no cold-cache 500
+path** (§1's pg-timeout problem is segments-only — sortie pulls from
+a different DB query that doesn't trip the 20 s timeout). At 168 h
+sortie is faster than 1 h segments. Migrating is the right move.
+
+**One missing piece blocks a drop-in migration: lat/lon support.**
+`/api/sorties` accepts `airport=<icao>&hours=<n>` but silently
+ignores `lat=&lon=&radius_nm=` — verified by byte-identical
+responses (md5 d22ab831...) with and without geo params on otherwise
+identical queries. The point-noise report is **listener-anchored**,
+so it needs either:
+
+- **(a)** server-side `?lat=&lon=&radius_nm=` filter on `/api/sorties`
+  that returns only sorties whose `sortie_path` passes within radius
+  of the listener point. Cleanest; matches the existing
+  `/api/excursions/segments` shape; lets the client stay listener-
+  oriented.
+- **(b)** client computes closest approach itself by walking the
+  `sortie_path[][]` of every sortie returned by airport-anchored
+  queries, with the client pulling sorties from each Front Range
+  airport (KBDU + KBJC + KAPA + KFNL + KEIK + KLMO + KGXY) in
+  parallel. Workable but means 7 × the bandwidth on every refresh
+  and re-implementing the geometry filter the segments endpoint
+  already does.
+
+**Ask:** add `?lat=&lon=&radius_nm=` to `/api/sorties` mirroring the
+segments-endpoint behaviour (return only sorties whose
+`sortie_path` enters the listener radius). Once that lands the
+client migration is a straight swap: same lat/lon/radius/hours
+parameters, the response carries richer data the page wants
+(corrected altitudes via `sortie_path_amendment`, integrated
+purposeML via `sortie_purpose`, per-cycle tow release via
+`sortie_tow_release` driving §12.1 winch gating), and the perf
+roughly halves on warm hits while removing the cold-cache 500
+class entirely.
+
+**Field-mapping for the migration** (sortie → what it replaces on
+the segments path):
+
+| Sortie field | Replaces (segments) | Notes |
+| --- | --- | --- |
+| `sortie_path[][lat,lon,alt_msl,ts]` | `segments[].points[]` | One flat path per sortie instead of klass-banded sub-segments. Altitudes already corrected by `sortie_path_amendment.alt_offset_ft`. `sortie_path[i][4]` carries `quality ∈ {real, repaired}` — client should prefer real for headline metrics. |
+| `sortie_purpose` + `_source` + `_confidence` | `track.purpose` (V3 §1) | Same V3 buckets. Already wired client-side; just read from the new field name. |
+| `sortie_tail`, `sortie_type` | `track.tail`, `track.type` | Same. |
+| `sortie_tow_release[]` | (not on segments) | §12.1 winch gating activates automatically. |
+| `sortie_max_pop_segment` + `sortie_noise_segments` | (loosely replaces `segments[].klass` info) | Pre-computed pop/report/vnap event windows; client can render headline noise events from this directly. |
+| `sortie_alt_quality_summary` | (new) | Aggregate quality of the sortie; useful for confidence weighting. |
+| `sortie_takeoff_ts` / `sortie_landing_ts` | (per-segment startedAt / endedAt) | Sortie-level; client computes per-segment from `sortie_path[i][3]`. |
+
+**Status: [PENDING-SERVER] — needs lat/lon filter on /api/sorties.**
+Channel can re-flip when the geo filter lands.
+
+---
+
+#### 12.2 — Original ask (kept for context)
+
 User direction 2026-06-03: *"sorties are faster and contain more
 information, better altitude information etc"*. Sortie payloads
 carry:
