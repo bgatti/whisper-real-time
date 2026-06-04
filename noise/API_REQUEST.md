@@ -390,6 +390,124 @@ emitting `event: pass\ndata: {...}` for each new audible flight. The
 kiosk already has the WebSocket infra
 (`/api/adsb/stream`); SSE mirrors that for the report use case.
 
+### 12. Take-Action panel — turn the report into a petition
+
+User direction 2026-06-03: residents reading the report want a
+*next step* — somewhere they can grab petition language they can
+send to the FAA / Congress / city council to push for the changes
+the What-If sliders are modeling. The page already proves the noise
+is real and shows what would help; the missing piece is the contact
++ text. A fixed bottom-right "Take Action" button opens an action
+panel listing the petitions whose substitutes / scenarios the
+listener has nudged > 0 first, then the rest, with copy-paste-ready
+text and target-official contacts per petition.
+
+**Status — V1 landed 2026-06-03, client-side.** New
+`noise/web/public/actions.json` carries seven petitions, each tied
+to a substitute / scenario code so the action panel can prioritize
+ones relevant to the listener's active sliders:
+
+- `EUROFOX_FAA_CERT` — accept EASA type certificate for Aeropro
+  Eurofox glider tow. Triggers when `eurofox_pct > 0`.
+- `VELE_FAA_CERT` — certify Pipistrel Velis Electro for US flight
+  training. Triggers when `electric_pct > 0`.
+- `SIM_HOURS_1500` — FAA accept silent-simulator hours toward the
+  1500-hour ATP requirement. Triggers when `simx_pct > 0` (and any
+  time the page surfaces training noise).
+- `ATPR_1500_REVIEW` — congressional review of the 1500-hour rule
+  (no evidence base; quadruples small-aircraft traffic). Triggers
+  when `atpr_pct > 0`.
+- `BACKCOUNTRY_OPEN` — open backcountry airstrips + waterways in
+  CO so training traffic disperses out of urban airspace. Always on.
+- `WINCH_KBDU` — petition KBDU airport board to investigate winch
+  launches. Triggers when `winch_agl_ft > 0`.
+- `SUBSIDY_ELECTRIC` / `CAPITALIZE_MOTORGLIDER` — find donor /
+  underwrite quieter training. Always on (no FAA action needed,
+  community-organize).
+
+Client work: new `ActionPanel` modal in
+[noise/web/src/PointNoiseReport.jsx](web/src/PointNoiseReport.jsx),
+fixed "📣 Take Action" button bottom-right (above the docked
+sliders), modal lists active-first then all. Each petition card:
+target official, suggested mail-to / address, full petition text,
+copy-to-clipboard button. No server roundtrip.
+
+**Open server-side asks for V2:**
+
+#### 12.1 — Surface sortie-tow release altitudes for winch gating
+
+User direction 2026-06-03: *"sortie api supports max height for tow
+sorties, so the winch height should silence tow_plane where
+sortie.height.max < slider"*.
+
+The sortie endpoint already carries the data the client needs:
+`sortie_tow_release[].release_alt_agl_ft` (per-cycle release AGL,
+documented at
+[noise/web/sortiesPlugin.js:2823](web/sortiesPlugin.js#L2823)).
+Reading max across the cycle list gives the per-sortie "highest
+release" — if that's below the listener's winch slider, the tow
+plane could have been replaced by a winch launch and its dBA
+contribution should go to zero in the scenario world.
+
+**Ask:** none — the data is already present. Client will add a
+`maxReleaseAglFt(sortieTowRelease)` helper that returns
+`max(release_alt_agl_ft)` across the cycle blob, and wire it into
+the WNCH segment-substitution path so tow plane sorties whose
+maximum release is at or below `scenario.winch_agl_ft` go silent.
+
+Flagging here in case the server team wants to pre-roll the max as
+`sortie_tow_release_max_release_agl_ft` (a single number is cheaper
+than a small array for the client to fold). Not blocking — happy
+to compute it on the client.
+
+#### 12.2 — Migrate the page from `/api/excursions/segments` to `/api/sorties`?
+
+User direction 2026-06-03: *"sorties are faster and contain more
+information, better altitude information etc"*. Sortie payloads
+carry:
+
+- corrected altitudes (`sortie_path` with amendment offset already
+  applied; `sortie_alt_quality` quality-tags each fix as
+  `real` / `repaired`).
+- `sortie_purpose` + `sortie_purpose_source` + `sortie_purpose_confidence` +
+  `sortie_purpose_reasons` (purposeML output integrated per-sortie,
+  matches the V3 work already client-side).
+- `sortie_tow_release[]` (per-cycle release AGL — § 12.1 winch
+  gating).
+- `sortie_noise_segments[type=pop|report|vnap]` already
+  pre-computed at the listener for any segments that scored.
+
+Compare to the current `/api/excursions/segments`, which the page
+post-processes for `purpose` / dBA / closest-approach geometry — all
+of which the sortie endpoint already returns rolled up.
+
+**Ask:** advice from the server team on whether the page should
+migrate the data backbone from `segments` to `sorties`, or whether
+the two endpoints continue to coexist (segments = per-fix scoring,
+sortie = per-flight roll-up). If migration is wanted, please call
+out which `sortie_*` fields replace which `segments[*]` fields so
+the client can refactor cleanly rather than guess.
+
+Specifically, does `/api/sorties` accept the same
+`?lat=&lon=&hours=&radius_nm=` listener-anchored query the page
+already uses for segments? If not, that's the minimum
+spec-the-client needs.
+
+#### 12.3 — Action-tag metadata in `substitutes.json`?
+
+Each substitute currently lists `replaces_purposes` so the client
+knows when to populate `alt_airframe_candidates`. To wire the
+take-action panel cleanly the client also needs to know **which
+petitions become more relevant** when a substitute slider goes up.
+Today the client does this via the `triggered_by` field inside
+`actions.json` (e.g. `triggered_by: "electric_pct > 0"`). That
+works; just calling it out so the server team knows the client is
+reading scenario-code state to drive UI.
+
+**Ask:** none today. Keep the action-tag glue client-side; if a
+substitute is ever added that needs a petition we don't have, we'll
+add to `actions.json` ourselves.
+
 ### 11. What-if scenarios — quieter-fleet substitutions
 
 The point-noise report tells the listener what *did* happen overhead.
@@ -1030,6 +1148,113 @@ flakes are pre-existing DB-dependent noiseReports tests, unrelated).
 URL hash, both modify the eliminated-tracks set, business-model table
 gains two new columns (Mechanism + Regulatory NPV) when either slider
 > 0. Channel closes on this section.
+
+#### V3 additions — surface purposeML shape inference on the page
+
+Server-side groundwork landed 2026-06-01: the `purposeML/` library
+is now on disk (PR series feeding into PR
+[bgatti/KnownRisks#5](https://github.com/bgatti/KnownRisks/pull/5)),
+which means `resolvePurposeWithShape` actually fires its shape step
+and `/api/excursions/segments` rows now carry one of:
+
+- `purpose_source: 'special_use' | 'type' | 'tracked'` — the
+  existing/curated path. Verdict is the legacy
+  `purposeOf` taxonomy (training, tow_plane, glider, biz_jet, etc).
+- `purpose_source: 'shape' | 'shape-hedged'` — purposeML fired.
+  Verdict is from the **richer purposeML bucket list**
+  (see [purposeML/ADOPTING_PURPOSE_ML_API.md](web/purposeML/ADOPTING_PURPOSE_ML_API.md)
+  §"Buckets"): `glider_local | glider_xc | tow_plane | training |
+  pattern_solo | survey | patrol | airline | biz_jet | turboprop |
+  ga_xc | ga_local | helicopter | unknown`. Carries
+  `purpose_confidence` in (0.5, 0.95). Confidence ≥ 0.7 = strong;
+  0.5–0.7 = hedged, treat as advisory.
+
+The client's current `PURPOSE_LABEL` + `PURPOSE_COLOR` maps in
+[noise/web/src/PointNoiseReport.jsx](web/src/PointNoiseReport.jsx)
+only know the legacy taxonomy — `glider_local`, `glider_xc`,
+`pattern_solo`, `ga_xc`, `ga_local`, `survey`, `patrol` will render
+as raw strings (or fall to "Unknown") today. That's the gap to
+close.
+
+**Status: [WIP] — V3 spec pushed 2026-06-01 by server team.**
+
+##### V3 §1. Extend PURPOSE_LABEL + PURPOSE_COLOR
+
+Add the seven new bucket entries the legacy maps don't cover:
+
+```js
+const PURPOSE_LABEL = {
+  // ...existing entries...
+  glider_local:  'Glider (local soaring)',
+  glider_xc:     'Glider (cross-country)',
+  pattern_solo:  'Pattern (solo / non-school)',
+  ga_local:      'GA local (around-the-pattern)',
+  ga_xc:         'GA cross-country',
+  survey:        'Aerial survey / mapping',
+  patrol:        'Patrol / law enforcement',
+}
+const PURPOSE_COLOR = {
+  // ...existing entries...
+  glider_local:  '#a78bfa', // violet-400 (existing glider color)
+  glider_xc:     '#7c3aed', // violet-600 (darker for XC)
+  pattern_solo:  '#fbbf24', // amber-400 (close to training but distinct)
+  ga_local:      '#60a5fa', // blue-400 (existing ga_single color)
+  ga_xc:         '#3b82f6', // blue-500 (darker for XC)
+  survey:        '#22d3ee', // cyan-400 (matches existing survey)
+  patrol:        '#475569', // slate-600 (matches patrol)
+}
+```
+
+##### V3 §2. Surface `purpose_source` as a per-row badge
+
+In the per-track tables (e.g. "Most-active individual aircraft"),
+add a small badge to the right of the purpose label showing the
+source — so a viewer can tell `glider_xc` came from shape inference
+vs `glider` came from the curated type-regex:
+
+| Source | Badge | Tooltip |
+|---|---|---|
+| `special_use` | `★ curated` (gold) | "Authoritative registry entry" |
+| `type` | `T` (slate) | "Inferred from ICAO type code" |
+| `tracked` | `DB` (slate) | "Stored in the tracks database" |
+| `shape` | `~ shape (87%)` (cyan; show `purpose_confidence` as %) | "Inferred from flight-path shape via purposeML" |
+| `shape-hedged` | `~ hedge (62%)` (cyan, faded) | "Hedged purposeML verdict — treat as advisory" |
+
+Keep the badge small enough that it doesn't crowd the row; the
+purpose label is still the headline. Tooltip + a once-per-page
+legend chip should be enough explanation.
+
+##### V3 §3. Optional filter — toggle "show only high-confidence shape"
+
+The "Filter by purpose" control in the page header has a list of
+purpose codes today. Add an optional toggle: *"Only shape-inferred
+high-confidence"* — when on, filter to tracks where
+`purpose_source === 'shape'` AND `purpose_confidence >= 0.7`. Lets a
+viewer audit purposeML's output independently of the curated path.
+
+Skip if the existing filter UI doesn't have room; this is a nice-to-have,
+not blocking. The badge from §2 is the primary V3 deliverable.
+
+##### V3 §4. Legend chip + about-link
+
+Add a small legend chip somewhere visible on the page (next to the
+existing "By based airport" / "By purpose" tabs is a good spot):
+
+```
+Purpose source:  ★ curated   T type   DB tracked   ~ shape (N%)
+```
+
+Link the `~` to `/api/purpose-ml/buckets` so a curious viewer can see
+the full bucket taxonomy. The endpoint already exists per
+[ADOPTING_PURPOSE_ML_API.md](web/purposeML/ADOPTING_PURPOSE_ML_API.md).
+
+##### V3 acceptance
+
+Flip `[WIP]` → `[DONE]` when the page renders at least one row with
+`~ shape (NN%)` badge from real prod data, AND the legend chip is
+visible. The shape branch needs a track with ≥ 30 points + ≥ 5 min
+active to fire — most pattern-work tracks at KBJC will trigger
+within a normal day's traffic.
 
 #### Channel back to server team
 
