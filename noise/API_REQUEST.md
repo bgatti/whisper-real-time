@@ -156,6 +156,571 @@ query layer.
 
 #### 2b — Limit-truncation is a correctness bug, not just performance
 
+> ✅ **RESOLVED 2026-06-04 — deploy `d3b6cda3` landed listener-anchored
+> geo-filter on `/api/sorties` (`?center=lat,lon&radius_nm=N`). Client
+> migrated off `/api/excursions/segments` in the same session — see
+> [web/src/PointNoiseReport.jsx](web/src/PointNoiseReport.jsx)
+> `fetchSortiesSameOrigin` + `sortieToTrack`. Verified at the same
+> Frasier Meadows listener (39.985, -105.21) on a 24 h window:
+> **294 sorties returned vs the old 20 / 500 LIMIT-truncated result** —
+> >14× more in-radius tracks now reach the page.**
+> The legacy banner stays in place keyed on `candidates_considered` so
+> any stale deployment still serving the segments shape would still
+> surface the warning, but the live page now bypasses the bug
+> entirely.**
+
+#### 2c — `/api/sorties` silently caps `window_hours` at 48
+
+**Filed 2026-06-04.** Now that the geo-filter is live (§ 2b) the page
+exposes a `7 d` / `14 d` / `30 d` time-window switch (see
+`WINDOW_PRESETS` in
+[noise/web/src/PointNoiseReport.jsx](web/src/PointNoiseReport.jsx)).
+Curl evidence that the server is silently truncating the window:
+
+```
+endpoint: /api/sorties?center=39.985,-105.21&radius_nm=4&hours=H
+H=72    sorties=465  sortie_window_hours=48  span=2026-06-02T06:38 → 2026-06-04T03:40
+H=168   sorties=465  sortie_window_hours=48  span=2026-06-02T06:38 → 2026-06-04T03:40
+H=336   sorties=465  sortie_window_hours=48  span=2026-06-02T06:38 → 2026-06-04T03:40
+H=504   sorties=465  sortie_window_hours=48  span=2026-06-02T06:38 → 2026-06-04T03:40
+H=720   sorties=465  sortie_window_hours=48  span=2026-06-02T06:38 → 2026-06-04T03:40
+H=1344  sorties=465  sortie_window_hours=48  span=2026-06-02T06:38 → 2026-06-04T03:40
+```
+
+The same 465-sortie response is returned byte-for-byte regardless of
+the `hours` parameter once it exceeds ~48. The `sortie_window_hours`
+echo confirms the server is interpreting every value above 48 as 48
+without an error or warning.
+
+**Why this matters:**
+- `/point-noise` advertises 14 d / 30 d windows to support multi-week
+  noise trend analysis (the kind of evidence a takings petition or city
+  council brief needs — a week of June overflights doesn't make the
+  case alone).
+- A response payload of 12 MB / 465 sorties at the current 48 h cap
+  means a 14 d window would land around 80 MB / 3 k sorties at the same
+  density. That's heavy but the page deduplicates by tail so most of
+  the bandwidth pays off. Per the user 2026-06-04: *"7days, query is
+  fast enough, maybe we can do 2 weeks, 1 month? curl to ensure we are
+  getting more records 800 might be ok."*
+- Right now the 7-d, 14-d, 30-d buttons all show the same data because
+  the server caps the underlying query — the UI lies about the period.
+
+**Ask:**
+1. Raise the `window_hours` cap to at least 30 days (720 h) on
+   `/api/sorties` so the multi-week buttons return distinct data.
+2. If the cap is intentional (perf protection), return an explicit
+   413 / 400 with the actual cap echoed so the client can render a
+   "max window is N hours" hint, instead of silently truncating. The
+   silent-truncate failure mode is identical in shape to the §2b bug
+   we just fixed — it makes the client look broken when it's actually
+   the server quietly ignoring the parameter.
+3. If perf protection is real, an optional `?paginate=cursor` or
+   `?compact_path=true` (sortie metadata only, no path coords) for the
+   "I just need counts and metadata across a long window" use case
+   would let the page front-load metadata then lazy-fetch full paths
+   on demand.
+
+**Status: [PENDING-SERVER].** Client buttons (14 d / 30 d) ship in the
+same session against the 48 h ceiling so the UI works the instant the
+server cap lifts.
+
+#### 2c — Server response 2026-06-04 ✅ *partially landed* (and a new failure mode)
+
+**Cap is gone for windows ≤ ~168 h.** Sweep against the same listener:
+
+```
+hours=  1  echoed=  1  sorties=   18
+hours=  6  echoed=  6  sorties=   72
+hours= 12  echoed= 12  sorties=   78
+hours= 24  echoed= 24  sorties=  287
+hours= 48  echoed= 48  sorties=  482
+hours= 72  echoed= 72  sorties=  677
+hours=168  echoed=168  sorties= 1450  (was 0 when capped at 48h yesterday)
+hours=169  echoed=169  sorties= 1474
+hours=192  echoed=192  sorties= 1639
+hours=240  echoed=240  sorties= 1976
+hours=336  echoed=336  sorties=    0   ← cliff
+hours=720  echoed=720  sorties=    0
+```
+
+`window_hours` now echoes back what the client requested up to 720 —
+the silent clamp at 48 is fixed. Recent windows return real data
+linearly.
+
+**New silent-empty failure mode at the historical-archive boundary.**
+For `hours ≥ ~336`, the response shape is:
+
+```
+sortie_count: 0
+sortie_window_hours: 720
+sortie_source: "db_timeout:historical 2026-05-05..2026-06-04"
+```
+
+The server hits a DB timeout against the historical archive
+(cold-cache, larger date range, presumably a different table) and
+returns 200 OK with the failure annotation in `sortie_source` —
+NOT a 503 + Retry-After. The page treats it as "no data in this
+radius" and renders empty, which is the exact UX bug § 2c-(2) called
+out: the user can't tell the difference between "your listener is in
+a quiet zone" and "the server gave up".
+
+**Client mitigation this session:** added a rose-toned banner that
+surfaces the failure when `sortie_source` matches `/^db_timeout:/`
+(see [PointNoiseReport.jsx](web/src/PointNoiseReport.jsx) — search
+for "Server's historical-archive query timed out"). User sees:
+
+> Server's historical-archive query timed out for the requested
+> window. `db_timeout:historical 2026-05-05..2026-06-04`. Try a
+> shorter window (≤ 7 d) — recent ranges hit the live cache and
+> return in < 1 s.
+
+**Remaining ask:** return a proper 503 + `Retry-After: <s>` (or 504
+gateway-timeout) for the timeout path so the client's existing
+cold-cache-retry handler in `fetchChunk` engages. The
+`sortie_source` annotation is a fine secondary signal but the
+HTTP-level failure code is what every standard client tolerates
+without bespoke string-matching.
+
+**Status: [PARTIAL — cap lifted, but historical-archive timeouts
+return empty 200 instead of 503/504].**
+
+#### 2d — Time-range params on `/api/sorties` for progressive paging
+
+**Filed 2026-06-04, per user direction "if we need time range in api,
+just ask".** The page is shifting to a progressive-load model: start
+with the trailing 12 h (renders fast), then append 24 h chunks of
+older data until the user's flight-count target (~800) is met, with
+the UI live-updating as each chunk arrives. The point of going
+chunked is to keep the initial render fast AND avoid the
+silent-truncation problem in § 2c — each chunk is small enough that
+the server cap isn't the binding constraint.
+
+The current API shape (`?hours=N&center=...&radius_nm=R`) is
+trailing-window only: every value returns the trailing N hours of
+data ending at "now". There's no way to ask for a SPECIFIC older
+slice ("hours 24–48 ago", "hours 48–72 ago"), so chunked loading
+requires re-fetching the entire trailing window for each step,
+which (a) wastes bandwidth and (b) still hits the § 2c cap as soon
+as the window crosses 48 h.
+
+**Ask:** add time-range parameters to `/api/sorties`. Either of these
+shapes works:
+
+- **(a)** `?from=<iso8601>&to=<iso8601>` — explicit absolute window.
+  Cleanest; lets the client deterministically chunk into any slicing
+  scheme it wants (24 h, 6 h, calendar-day, …) and verify that the
+  server honoured the window via the same fields in the response.
+- **(b)** `?end_ts=<iso8601>&hours=N` — relative window with an
+  adjustable endpoint. Mirrors the current `?hours=N` shape (so the
+  current implementation becomes `?end_ts=now&hours=N`) and lets the
+  client paginate by walking `end_ts` backward.
+
+The shape of the response (echo of the resolved window via
+`sortie_window_hours` / `sortie_window_from` / `sortie_window_to`)
+matters as much as the request — the client uses it to know whether
+the server actually honoured the requested window, vs the silent
+truncation we hit in § 2c.
+
+**Status: [PENDING-SERVER].** Until time-range support lands, the
+client will progressively load by re-issuing `?hours=N` with growing
+N. That works up to the § 2c cap (currently 48 h, ~465 sorties at
+this listener) and then stalls — flagged in the loader's UI so the
+user knows when the wall hits.
+
+---
+
+#### 2h — 🚨 P0: live cache timing out for ALL window sizes (+ failure responses are being cached)
+
+**Filed 2026-06-04T19:04Z, user-observed during active report build.**
+Yesterday the same listener returned **1,450 sorties** for a 7 d
+window in < 1 s. Right now every window from 1 h up returns
+**0 sorties**, and the server is **caching its own failure for 15 s**
+via `Cache-Control: public, max-age=15` — so every consumer (kiosk,
+pilot-console, /point-noise) sees the same empty payload across that
+window.
+
+##### Reproduce (copy/paste, no auth required)
+
+```bash
+# Run any of these against http://localhost:5183 (dev proxy) or
+# https://noise-production.up.railway.app (prod). Same response.
+curl -sI -w "\nstatus=%{http_code} ttfb=%{time_starttransfer}s total=%{time_total}s\n" \
+  "http://localhost:5183/api/sorties?center=39.985,-105.21&radius_nm=4&hours=1"
+
+curl -s "http://localhost:5183/api/sorties?center=39.985,-105.21&radius_nm=4&hours=12" \
+  | python -c "import sys,json; d=json.load(sys.stdin); print('count=', d['sortie_count'], 'src=', d.get('sortie_source'))"
+```
+
+##### Observed response (hours=1, 19:04:08 UTC)
+
+```
+HTTP/1.1 200 OK
+Content-Type: application/json
+Cache-Control: public, max-age=15            ← BUG: caching the failure
+Date: Thu, 04 Jun 2026 19:04:08 GMT
+Content-Length: 13320
+
+{
+  "sortie_window_hours": 1,
+  "sortie_geo_filter": {"lat":39.985,"lon":-105.21,"radius_nm":4},
+  "sortie_count": 0,
+  "sortie_source": "db_timeout:live 1h",
+  ...
+}
+```
+
+##### Window sweep (single timestamp, listener-anchored Frasier Meadows)
+
+| hours | sortie_count | sortie_source                              |
+|------:|-------------:|--------------------------------------------|
+|     1 |            0 | `db_timeout:live 1h`                       |
+|     6 |            0 | `db_timeout:live 6h`                       |
+|    12 |            0 | `db_timeout:live 12h`                      |
+|    24 |            0 | `db_timeout:live 24h`                      |
+|    48 |            0 | `db_timeout:live 48h`                      |
+|   168 |            0 | `db_timeout:historical 2026-05-28..2026-06-04` |
+
+`sortie_source` now carries **two distinct failure modes**:
+
+- **`db_timeout:live <Nh>`** — primary/live DB query timing out for
+  every window size including 1 h. A shorter window does NOT help.
+- **`db_timeout:historical <range>`** — archive table times out for
+  older windows (already documented in § 2c).
+
+Both still return HTTP 200 + `sortie_count: 0` — the silent-empty
+failure mode § 2c-(2) called out. Page can't tell "quiet listener"
+from "DB gave up".
+
+##### Asks, in priority order
+
+1. **🚨 Investigate the live cache.** Likely suspects (in the order
+   I'd check): pg-pool exhaustion, missing index after a schema
+   migration, dropped warm cache after a deploy/restart, or a stuck
+   warmup job holding the query path. Yesterday's 1450-sortie
+   7 d query is a known-good baseline to A/B against.
+2. **🚨 Stop caching failure responses.** `Cache-Control: public,
+   max-age=15` on a `sortie_count: 0 + sortie_source: db_timeout:*`
+   response is wrong on two axes: it amplifies the failure window
+   (every consumer in those 15 s gets the cached empty), and it
+   defeats the client's natural retry behaviour. Quick fix: emit
+   `Cache-Control: no-store` whenever `sortie_source` starts with
+   `db_timeout:` or `sortie_count` is 0 with any error annotation.
+3. **Return 503 + `Retry-After: <s>`** instead of 200 for the
+   timeout path. The client's existing cold-cache-retry handler
+   (`fetchChunk` → `isRetryableErr` in `runReport`,
+   [noise/web/src/PointNoiseReport.jsx](web/src/PointNoiseReport.jsx))
+   engages automatically on 5xx with no client change required.
+4. **Add `sortie_health: "ok" | "live_db_degraded" | "archive_degraded"`**
+   at the top of the response so the kiosk, the pilot-console, AND
+   the noise page can render a shared outage banner instead of each
+   consumer separately string-matching `sortie_source`.
+
+##### Client mitigation (shipped in same session, no server dependency)
+
+The page now ships a **kind-aware rose banner** that parses
+`sortie_source`:
+
+- `db_timeout:live <Nh>` → *"Server's live database is timing out
+  — every window size is currently returning empty. This is a
+  server-side incident, not a problem with your listener / radius
+  / window. A shorter window will not help."*
+- `db_timeout:historical <range>` → *"Server's historical-archive
+  query timed out for the requested window. Try a shorter window
+  (≤ 7 d)."*
+
+So users now see the truth instead of a silent empty radius. The
+`sortie_source` annotation is fine as a permanent secondary signal
+even after the 503 work lands.
+
+**Status: [PENDING-SERVER — P0 incident, user-blocking, filed 19:04Z].**
+
+---
+
+#### 2g — Publish the canonical noise-propagation + throttle-curve parameters
+
+**Filed 2026-06-04.** The /point-noise page now applies a defensible
+acoustic propagation kernel (pure 1/r² spherical spreading +
+AEDT/NPD-style 22·log10(throttle) curve, fit to ANP per-aircraft NPD
+tables for piston-prop singles). The coefficients (22, 20) are
+inline in the page today. Per the user's "use the API channel for
+things that should be universally true" preference, these should
+ship from the server so the leaderboard / kiosk / page all read the
+same dBA for the same aircraft at the same slant.
+
+Suggested shape (`GET /api/noise-propagation`):
+
+```json
+{
+  "generated": "2026-06-04",
+  "model": "spherical-1r2-aedt-throttle",
+  "reference_slant_ft": 500,
+  "agl_floor_ft": 100,
+  "throttle_floor_frac": 0.05,
+  "propagation_coef_db_per_decade": 20,
+  "throttle_coef_db_per_decade": 22,
+  "sources": [
+    "SAE AIR-1845A (1995) — NPD method specification",
+    "ICAO Doc 9911 (2008/2018) — implementation guidance",
+    "FAA AEDT 3 Technical Manual §4.6 — propagation + throttle",
+    "Smith MJT, Aircraft Noise (Cambridge UP 1989) §6 — piston-prop fit"
+  ],
+  "per_category_overrides": {
+    "jet":        { "throttle_coef_db_per_decade": 22 },
+    "turboprop":  { "throttle_coef_db_per_decade": 20 },
+    "piston":     { "throttle_coef_db_per_decade": 22 },
+    "helicopter": { "throttle_coef_db_per_decade": 16, "note": "rotor noise dominated; lower power-sensitivity" }
+  }
+}
+```
+
+The client already accepts the formula structure parameterically (one
+function in PointNoiseReport.jsx — `estDbaAtListener` +
+`throttleDbaAdjustment`), so the migration is just a fetch + state
+read. Until the endpoint exists the page uses the inline defaults
+listed above.
+
+**Status: [PENDING-SERVER].**
+
+#### 2f — Push the type → base-dBA table to the server (and stop classifying helicopters as gliders)
+
+**Filed 2026-06-04, per user direction "very important that we have a
+type → base dbA at full throttle / should be pushed to API / but these
+are WAY wrong. gliders have a base dbA of 0 at any distance".**
+
+Two problems surfaced by today's listener readout:
+
+```
+Time              Tail    Type   Purpose                          dBA   AGL   Dist
+Jun 2 12:16 PM    N851MB  AS50   Glider (local soaring)~shape(85%)  79   800  0.22 nm
+May 30 09:01 AM   N851MB  AS50   Glider (local soaring)~shape(85%)  79   700  0.24 nm
+```
+
+1. **The type → base-dBA table lives in the client** (see TYPE_BASE_DBA
+   in [noise/web/src/PointNoiseReport.jsx](web/src/PointNoiseReport.jsx)),
+   so the leaderboard, the kiosk, and the page can disagree on what a
+   given airframe sounds like. **Ask:** publish the canonical
+   per-type-code base-dBA-at-1000-ft-AGL/500-ft-slant table from the
+   server (e.g. `GET /api/type-noise-profile` returning
+   `{ "AS50": { "base_dba": 84, "category": "helicopter", "engineless": false }, … }`).
+   The client already has the mapping inline — pushing it server-side
+   removes the drift risk.
+
+2. **purposeML is classifying engine-powered helicopters as
+   `glider_local`** (see N851MB above — AS350 Squirrel,
+   single-turbine helicopter, repeatedly tagged "Glider (local
+   soaring)" with shape-confidence 85 %). The geometry hedge here is
+   plausible (a helicopter mountain-tour pattern can look like a
+   glider thermalling pattern from a coarse track), but the type code
+   AS50 is unambiguous: type codes that match the helicopter family
+   (AS50/AS55/AS65, B06/B407/B429, EC20/EC30/EC35/EC45, H500, etc.)
+   should NEVER be eligible for the glider_local / glider_xc / glider
+   purposes. **Ask:** add a hard-no rule in purposeML that excludes
+   helicopter / turboprop / piston-twin types from the glider buckets
+   regardless of how confidently the shape-classifier matches a
+   soaring pattern.
+
+The downstream noise math is correct (AS50 base_dba = 84, page reports
+79 dBA at 800 ft AGL — reasonable). The label is the bug: a user
+reading the listener events sees "Glider (local soaring) — 79 dBA" and
+loses confidence in the entire classification chain.
+
+**Status: [PENDING-SERVER]** for both. Client-side mitigation in the
+same session: the page will treat the purpose label as advisory when
+the type is in the helicopter / turboprop / jet families and report
+the type's category instead (e.g. "Helicopter" not "Glider").
+
+#### 2e — Serve nice-text purpose labels + colour palette from the API
+
+**Filed 2026-06-04, per user direction "we have a purpose translator
+(Nice Text) in the project, could we ... ask the API for a NiceText
+json and push this to the API".** The page (and the leaderboard, and
+the kiosk) each carry their own inline map of purpose-code → human
+label + colour, and they drift over time. The new
+[noise/web/public/purpose_labels.json](web/public/purpose_labels.json)
+consolidates the page's copy as a static asset; the channel ask is to
+move it to the server so every consumer reads the same canonical map.
+
+Shape (mirror the file directly):
+
+```json
+{
+  "generated": "2026-06-04",
+  "palette_id": "sage-2026-06-04",
+  "purposes": {
+    "training":     { "label": "Training",        "color": "#7fb3a3" },
+    "tow_plane":    { "label": "Glider tow",      "color": "#c9a96a" },
+    "glider_local": { "label": "Glider (local soaring)", "color": "#b6abce" },
+    ...
+  }
+}
+```
+
+**Ask:** stand up `GET /api/purpose-labels` that returns this exact
+shape. The client already fetches /purpose_labels.json with a graceful
+fallback to inline maps; once the API endpoint exists the page can
+point at it (the static file becomes the fallback when the endpoint
+404s, not the source of truth).
+
+**Why:** the maps drift. Today the page calls a `glider_xc` track
+"Glider (cross-country)", the leaderboard calls it "XC glider", the
+kiosk omits it entirely. Centralising the nice text removes the drift
+AND lets the server roll a new code/colour without a client deploy.
+
+#### 2e — Server response 2026-06-04 ✅ *partial landing*
+
+The server now ships `sortie_purpose_label_catalog` inline on every
+`/api/sorties` response (no separate `/api/purpose-labels` endpoint —
+inline is fine, the client merges it during response adaptation; see
+`adaptResponse` in
+[noise/web/src/PointNoiseReport.jsx](web/src/PointNoiseReport.jsx)).
+
+Curl evidence:
+
+```
+GET /api/sorties?center=39.985,-105.21&radius_nm=4&hours=24
+→ sortie_purpose_label_catalog: {
+    "cross_country":  "Cross Country",
+    "ga_local":       "GA Local",
+    "ga_xc":          "GA Cross Country",
+    "glider_competition": "Glider — Competition",
+    "glider_local":   "Glider — Local",
+    "glider_soaring": "Glider — Soaring",
+    "glider_training":"Glider — Training",
+    "glider_xc":      "Glider — Cross Country",
+    "helicopter":     "Helicopter",
+    "local":          "Local",
+    "pattern":        "Pattern",
+    "pattern_solo":   "Pattern (Solo)",
+    "practice_area":  "Practice Area",
+    "survey":         "Survey",
+    "tow_plane":      "Tow Plane",
+    "training":       "Training",
+    "transient":      "Transient",
+    "unknown":        "Unknown"
+  }
+```
+
+**Coverage delta vs the page's static map:**
+- Server SHIPPED 3 new codes the page didn't have:
+  `glider_competition`, `glider_soaring`, `glider_training` — added
+  to the page's static map this session (used as fallback colours;
+  server's labels win).
+- Server OMITTED 12 codes the page does have:
+  `airline / biz_jet / turboprop / experimental / ga_single /
+   ga_twin / medevac / firefighting / search_rescue / law_enforcement /
+   military / government / patrol / science`. These are still
+  fallback-only client-side until the server adds them.
+- Server's labels use em-dash + Title Case ("Glider — Local") vs the
+  page's parenthetical-lower ("Glider (local soaring)"). Server style
+  is now authoritative — page renders the server's strings verbatim.
+
+**Remaining ask (palette):** the inline catalog ships LABELS only.
+Per-purpose colours still live client-side in
+`/public/purpose_labels.json` (now using the editorial-warm-dark
+palette from pilot-console/console.css). The cleanest closing move is
+to add a `color` field alongside `label` on each catalog entry:
+
+```json
+"glider_local": { "label": "Glider — Local", "color": "#B7A0D4" }
+```
+
+so the kiosk and the page never drift on either field. Until that
+lands, the client merges server's labels over its own colours.
+
+**Status: [PARTIAL — labels landed inline, colours still pending].**
+
+**Update 2026-06-04 — coverage gap caught live.** User reported that
+"some purposes still not NiceText". Curl against
+`/api/sorties?center=39.985,-105.21&radius_nm=4&hours=24` enumerates
+13 distinct `sortie_purpose` values:
+
+```
+['cross_country', 'ga_local', 'ga_xc', 'glider_local',
+ 'local', 'patrol', 'pattern', 'pattern_solo',
+ 'practice_area', 'survey', 'tow_plane', 'training', 'transient']
+```
+
+The client's nice-text map was missing **4 of these 13**: `local`,
+`pattern`, `practice_area`, `transient` — they appeared in the events
+table as raw codes (e.g. "local", "pattern") instead of friendly
+labels. Filled the gap in
+[noise/web/public/purpose_labels.json](web/public/purpose_labels.json)
+this session.
+
+**Definitive ask — the full enumerated set the server should ship for**
+**at minimum** when /api/purpose-labels lands:
+
+| Code            | Suggested label                  | Source endpoint that emits it      |
+| --------------- | -------------------------------- | ---------------------------------- |
+| `training`      | Training                         | purposeML / school join            |
+| `pattern_solo`  | Pattern (solo / non-school)      | purposeML shape                    |
+| `pattern`       | Pattern                          | geometry                           |
+| `practice_area` | Practice area                    | geometry                           |
+| `local`         | Local                            | geometry / fallback                |
+| `tow_plane`     | Glider tow                       | type curated (PA25 / PA18)         |
+| `glider`        | Glider                           | type curated                       |
+| `glider_local`  | Glider (local soaring)           | purposeML shape                    |
+| `glider_xc`     | Glider (cross-country)           | purposeML shape                    |
+| `ga_local`      | GA local (around-the-pattern)    | purposeML shape                    |
+| `ga_xc`         | GA cross-country                 | purposeML shape                    |
+| `ga_single`     | GA single (private)              | type fallback                      |
+| `ga_twin`       | GA twin (private)                | type fallback                      |
+| `cross_country` | Cross-country                    | geometry                           |
+| `transient`     | Transient overflight             | geometry                           |
+| `helicopter`    | Helicopter                       | type curated                       |
+| `airline`       | Airline                          | type curated                       |
+| `biz_jet`       | Business jet                     | type curated                       |
+| `turboprop`     | Turboprop                        | type curated                       |
+| `experimental`  | Experimental / homebuilt         | type curated                       |
+| `medevac`       | Medevac                          | special-use                        |
+| `firefighting`  | Firefighting                     | special-use                        |
+| `law_enforcement` | Law enforcement                | special-use                        |
+| `military`      | Military                         | special-use                        |
+| `government`    | Government                       | special-use                        |
+| `patrol`        | Patrol                           | special-use                        |
+| `science`       | Science                          | special-use                        |
+| `survey`        | Survey                           | special-use                        |
+| `search_rescue` | Search & rescue                  | special-use                        |
+| `unknown`       | Unknown                          | fallback                           |
+
+**Secondary ask:** when the server starts emitting a new
+`sortie_purpose` code, please add the matching entry to
+`/api/purpose-labels` in the same deploy. Otherwise the page falls
+back to the raw code in the UI (what the user reported above).
+
+**Status: [PENDING-SERVER].** The client static-file path ships in the
+same session.
+
+---
+
+**Re-confirmed live 2026-06-04 (user request "when I request 30days, I
+don't get 30days").** Curl against the same listener with `hours=720`
+(30 d):
+
+```
+requested hours=720 (30 d)
+server echoed window_hours=48
+sorties returned=465
+fix span: 2026-06-02T06:38 → 2026-06-04T03:40   (actual data: 45.0 h)
+```
+
+The server is still capping. The user's experience right now is that
+clicking the **30 d** button surfaces a 45-hour slice — a 16-to-1
+silent truncation. This is a user-trust bug: the chip says "30 d" and
+the methodology box echoes "30 d" but the charts cover two days. From
+the page you cannot tell that the data is incomplete. **This is the
+identical failure mode the §2b LIMIT bug had before d3b6cda3 — the
+client looks broken when the server is quietly ignoring the
+parameter.**
+
+The bare minimum near-term fix is the §2c-(2) one: return the actual
+cap to the client so the chip can render `30 d → capped to 48 h` or
+similar, and the page can stop claiming a window it didn't get. The
+proper fix (cap raised to ≥30 d) is what unblocks the multi-week
+trend analysis the page exists to support.
+
+
 **Filed 2026-06-03** based on a user-side comparison of
 `/api/sorties?airport=KBDU&hours=12` vs
 `/api/excursions/segments?lat=40.005&lon=-105.205&hours=12&radius_nm=3`.
@@ -693,6 +1258,25 @@ than a small array for the client to fold). Not blocking — happy
 to compute it on the client.
 
 #### 12.2 — Migrate the page from `/api/excursions/segments` to `/api/sorties`?
+
+> ✅ **RESOLVED 2026-06-04 — server deploy `d3b6cda3` landed the
+> listener-anchored geo-filter (`?center=lat,lon&radius_nm=N`) on
+> `/api/sorties` with seven-test-case verification (KBDU + south
+> Boulder neighbourhood + AND-filterable with `airport=` + 400 on
+> invalid params). Client migrated in the same session:
+> `fetchSegmentsSameOrigin` → `fetchSortiesSameOrigin`; a `sortieToTrack`
+> adapter folds the sortie shape into the legacy `track` shape so the
+> downstream analysis pipeline (analyzeTrack → applyScenarioToRow →
+> segmentDba) needed minimal changes. `analyzeTrack` now computes
+> `alt_airframe_candidates` + per-segment `alt_dba_by_substitute`
+> client-side from the substitute registry, since those fields aren't
+> shipped on the sortie payload — net: zero behaviour change in the
+> What-If sliders, all 6 still drive substitution math correctly.**
+> **Verified at Frasier Meadows (39.985, -105.21) on a 24 h window:
+> 294 sorties returned vs the old 20 / 500 LIMIT-truncated result —
+> >14× the in-radius tracks now reach the page.** (Banner +
+> `candidates_considered` keep-alive code path retained for any stale
+> client still on the segments endpoint.)
 
 **Perf measured live 2026-06-03 (KBDU dev box, warm cache):**
 
