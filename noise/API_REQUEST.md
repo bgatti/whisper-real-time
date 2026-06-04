@@ -390,6 +390,66 @@ emitting `event: pass\ndata: {...}` for each new audible flight. The
 kiosk already has the WebSocket infra
 (`/api/adsb/stream`); SSE mirrors that for the report use case.
 
+### 15. Operational-capacity airframe counts per substitute
+
+**Filed 2026-06-03; technical debt landed in same turn.** The
+docked What-If sliders snap to whole airframe purchases by
+computing `step = round(100 / N)` where N is the count of distinct
+candidate tails in the current window
+([noise/web/src/whatif.js](web/src/whatif.js) `eligibleTailCount`).
+
+That works for VELE / EFOX — a Velis Electro replaces a C172
+one-for-one, a Eurofox replaces a PA-25 one-for-one. The
+data-driven count IS the operational answer.
+
+It doesn't work for SINU. The Pipistrel Sinus is a self-launching
+motorglider: each Sinus replaces a glider AND its paired tow
+plane operationally, and one Sinus serves multiple glider flights
+per day (no aerotow choreography between launches). The
+right "100 %" for SINU is "how many Sinus airframes operationally
+replace ALL local glider activity at this field" — which is a
+capacity calculation, not a count of tails currently in the data.
+
+User direction 2026-06-03: *"as technical debt, assume that 5
+sinus gliders would replace all local glider tows / so 5=100% /
+mark as technical debt and ask the API to calculate this properly".*
+
+**Client workaround (landed):** new `tdebt_airframe_count_override`
+field on the SINU substitute entry in
+[noise/web/public/substitutes.json](web/public/substitutes.json),
+hard-coded to `5`. The page reads it in `eligibleTailCounts` and
+overrides the data-driven count. Comment in the JSON marks it as
+technical debt pointing here.
+
+**Ask:** add a server-computed
+`operational_replacement_count` (or per-airport-keyed version)
+to `/substitutes.json`, OR expose a dedicated endpoint
+`GET /api/fleet/capacity?airport=<icao>&substitute_code=<code>`
+that returns the number of airframes required to operationally
+replace the substitute's target purpose-class at that field.
+
+Suggested formula (open to revision):
+
+```
+glider_launches_per_day_at_field = sum over last 30 days /
+                                    30  (smooth out weekend bumps)
+per_sinus_daily_capacity = 8   (configurable per substitute; pilots
+                                comfortable doing more cycles will
+                                tune up, conservative number for v1)
+operational_count = ceil(glider_launches_per_day_at_field /
+                         per_sinus_daily_capacity)
+```
+
+For KBDU the user's empirical estimate is `5`; the formula above
+hits `5` cleanly when the field has ~35-40 launches/day, which is a
+reasonable busy-summer-weekend number for SSB + Mile High combined.
+
+Once the server endpoint lands, the client drops the
+`tdebt_airframe_count_override` field and reads
+`operational_replacement_count` from the live response. Channel
+closes when the override field is removed from the page's
+substitutes.json read path.
+
 ### 14. Time-window UTC handling on `/api/excursions/segments`
 
 **Filed 2026-06-03; re-tested 2026-06-04.** The user dragged the
