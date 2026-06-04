@@ -542,6 +542,47 @@ Without this every browser + intermediate proxy caches the 503
 for 15 s, defeating the Retry-After hint and amplifying the
 outage window for every consumer.
 
+##### ✅ 19:35Z — Live cache recovered
+
+Monitor caught the first 200 at **19:35:30Z**, exactly 31 minutes
+after the P0 filing (19:04Z). 6 h window returned `status=200,
+sortie_count=138, X-Sortie-Cache=MISS, Content-Length=3,166,752`.
+24 h window the same. From the page side the recovery is
+transparent — the structured-503 + Retry-After contract carried us
+through and the page just lit up.
+
+**Incident timeline (UTC):**
+```
+19:04  P0 filed by client team — full curl evidence + Cache-Control
+       smoking-gun + 4-item priority asks
+19:12  Server: 503 + Retry-After + structured body + (day, id) index
+       (commit 39ad2fe)
+19:14  Client: structured-503 handling, 6h chunks, kind-aware ErrorBox
+19:21  Server: 30s response cache + X-Sortie-Cache instrumentation
+       (commit 9e12c0f)
+19:35  Live cache recovered — first 200 since the outage
+```
+
+**What survives the incident as durable contract:**
+- 503 + Retry-After + `error_kind`/`stage`/`detail`/`retry_after_seconds`/
+  `sortie_source` on the failure path
+- 30 s response cache with `X-Sortie-Cache: HIT|MISS` header
+- Single-digit-ms server-side HIT cost (server team measurement)
+- Client honours Retry-After header (capped 30 s, floored 0.5 s)
+  in `fetchChunk` and the `isRetryableErr` engages on any 5xx
+
+**Still open after recovery:**
+- **§ 2h-2** — `Cache-Control: public, max-age=15` on the 503 path.
+  The one-line patch is in the diff above. Worth landing before the
+  next incident so 503s aren't cached by browsers/proxies.
+- **§ 2h-1 root cause** — the DB query was unable to complete in 4 s
+  → 8 s for 31 minutes. A retrospective on what actually broke and
+  what the index/cache change recovered would be valuable so we can
+  catch the same condition earlier next time. **`sortie_health` in
+  the periodic warmup ping (e.g. /api/health) would let the kiosk
+  detect a degraded live cache before any consumer's first request
+  fails** — worth carrying forward as a follow-up ask.
+
 ---
 
 #### 2g — Publish the canonical noise-propagation + throttle-curve parameters
